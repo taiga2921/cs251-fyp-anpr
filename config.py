@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import importlib.util
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -434,16 +435,14 @@ def _validate_ocr(config: Config, result: ValidationResult, strict: bool) -> Non
     else:
         result.add_info(f"OK: OCR preprocess scale configured: {config.ocr_scale}")
 
-    try:
-        import paddleocr  # noqa: F401
-
-        result.add_info("OK: PaddleOCR package is available")
-    except Exception as exc:
-        message = f"PaddleOCR package is not available: {exc}"
+    if importlib.util.find_spec("paddleocr") is None:
+        message = "PaddleOCR package is not installed (pip install -r requirements.txt)."
         if strict:
             result.add_error(message)
         else:
             result.add_warning(message)
+    else:
+        result.add_info("OK: PaddleOCR package is installed")
 
 
 def _validate_backend(config: Config, result: ValidationResult) -> None:

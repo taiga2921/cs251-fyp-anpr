@@ -222,6 +222,7 @@ class ANPRProcessor:
         self._plate_model: Any = None
         self._models_loaded: bool = False
         self._ocr_engine: Any = None
+        self._run_candidates: list[PlateCandidate] = []
 
     def _make_run_dir(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -298,7 +299,11 @@ class ANPRProcessor:
         metrics.log_lines.append(f"Device: {self.config.device}")
 
     def load_ocr_engine(self, metrics: RuntimeMetrics) -> None:
-        """Initialize the OCR engine once per runtime."""
+        """Initialize the OCR engine once per runtime.
+
+        M4 uses PaddleOCR 2.x legacy API for stable local crop OCR:
+        PaddleOCR(...).ocr(image, cls=False)
+        """
         if self.config.ocr_engine != "paddleocr":
             raise OCRLoadError(f"Unsupported OCR engine: {self.config.ocr_engine}")
 
@@ -313,13 +318,15 @@ class ANPRProcessor:
             )
         except ImportError as exc:
             raise OCRLoadError(
-                "PaddleOCR is not installed. Install with: pip install paddleocr"
+                "PaddleOCR is not installed. Install with: pip install -r requirements.txt"
             ) from exc
         except Exception as exc:
             raise OCRLoadError(f"Failed to initialize PaddleOCR: {exc}") from exc
 
         metrics.ocr_engine_loaded = True
-        metrics.log_lines.append(f"OCR engine loaded: {self.config.ocr_engine}")
+        metrics.log_lines.append(
+            f"OCR engine loaded: {self.config.ocr_engine} (PaddleOCR 2.x legacy API)"
+        )
 
     def read_plate_text(
         self,
@@ -378,12 +385,12 @@ class ANPRProcessor:
         plate_detection: Detection,
         vehicle_detection: Detection | None,
         metrics: RuntimeMetrics,
-    ) -> None:
+    ) -> PlateCandidate | None:
         """Extract, preprocess, OCR, normalize, and validate a plate detection."""
         crop = extract_plate_crop(frame, plate_detection)
         if crop is None:
             metrics.plate_crops_rejected += 1
-            return
+            return None
 
         metrics.plate_crops_extracted += 1
         ocr_input = (
@@ -394,16 +401,16 @@ class ANPRProcessor:
         reading = self.read_plate_text(ocr_input, metrics)
         if reading is None or reading.confidence < self.config.min_ocr_confidence:
             metrics.plate_candidates_rejected += 1
-            return
+            return None
 
         normalized = normalize_plate_text(reading.raw_text)
         valid, _reason = validate_plate_text(normalized)
         if not valid:
             metrics.plate_candidates_rejected += 1
-            return
+            return None
 
         metrics.plate_candidates += 1
-        PlateCandidate(
+        return PlateCandidate(
             raw_text=reading.raw_text,
             normalized_text=normalized,
             confidence=reading.confidence,
@@ -807,6 +814,7 @@ class ANPRProcessor:
         validation_mode = "strict" if strict else "standard"
         metrics = RuntimeMetrics()
         status = "completed"
+        self._run_candidates = []
 
         metrics.log_lines.extend(
             [
@@ -854,15 +862,19 @@ class ANPRProcessor:
                     metrics.frames_processed += 1
                     self._last_processed_time = packet.timestamp
                     vehicles = self.detect_vehicles(packet.image, metrics)
+                    frame_candidates: list[PlateCandidate] = []
                     for vehicle in vehicles:
                         plates = self.detect_plates(packet.image, vehicle, metrics)
                         for plate in plates:
-                            self._process_plate_detection(
+                            candidate = self._process_plate_detection(
                                 packet.image,
                                 plate,
                                 vehicle,
                                 metrics,
                             )
+                            if candidate is not None:
+                                frame_candidates.append(candidate)
+                    self._run_candidates.extend(frame_candidates)
 
             metrics.source_completed = True
             self._finalize_stop_reason(metrics)

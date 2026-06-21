@@ -4,13 +4,49 @@
 
 Python ANPR runtime for vehicle and license plate processing.
 
-## Setup
+## Environment Setup
 
-```bash
+Recommended Python version:
+
+```text
+Python 3.11 or 3.12
+```
+
+Create and activate a virtual environment:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install --upgrade pip setuptools wheel
+```
+
+Install dependencies:
+
+```powershell
 pip install -r requirements.txt
 ```
 
-Place local YOLO `.pt` files and ensure PaddleOCR is installed. Model files are not committed to Git.
+Verify PyTorch and Ultralytics:
+
+```powershell
+python -c "import torch; print(torch.__version__); print(torch.rand(1))"
+python -c "from ultralytics import YOLO; print('ultralytics ok')"
+```
+
+If CPU-only PyTorch on Windows fails during normal install, use the official CPU wheel first, then install the remaining dependencies:
+
+```powershell
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+```
+
+Use a clean virtual environment and avoid unsupported Python/package combinations (for example Python 3.13 with incompatible wheels).
+
+## Setup
+
+Place local YOLO `.pt` files before running detection. Model files are not committed to Git.
+
+M4 uses **PaddleOCR 2.x legacy API** (`paddleocr<3` in `requirements.txt`).
 
 Configure models and OCR in `.env`:
 
@@ -36,7 +72,7 @@ python main.py run --source rtsp --dry-run --strict
 python main.py flush-backend-queue
 ```
 
-`run --dry-run` opens the source, schedules frames, loads YOLO models once, runs vehicle/plate detection, and performs OCR with normalization and validation on plate crops. Tracking, final events, evidence saving, and backend posting are not implemented yet.
+`run --dry-run` opens the source, schedules frames, loads YOLO models once, runs vehicle/plate detection, and performs OCR with normalization and validation on plate crops. Valid `PlateCandidate` objects are kept in memory for M5 handoff. Tracking, final events, evidence saving, and backend posting are not implemented yet. `events.jsonl` remains empty in M4.
 
 ## Output
 

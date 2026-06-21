@@ -1,5 +1,5 @@
-# M4 — OCR and plate normalization
 opencv-python
 numpy
 ultralytics
-paddleocr
+paddlepaddle
+paddleocr<3

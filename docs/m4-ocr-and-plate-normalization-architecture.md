@@ -52,11 +52,14 @@ Bridge detection (M3) and future event finalization (M5+) by producing validated
 ### config.py
 
 - OCR configuration fields and validation
-- Strict mode checks PaddleOCR package availability
+- Standard `check-config` uses lightweight `importlib.util.find_spec("paddleocr")` only
+- Strict mode fails if the PaddleOCR package is not installed
 
 ### anpr.py
 
 - All OCR, normalization, validation, and pipeline integration
+- M4 uses **PaddleOCR 2.x legacy API** (`PaddleOCR(...).ocr(image, cls=False)`)
+- Valid `PlateCandidate` objects are collected in `self._run_candidates` during each run
 - No `ocr.py` module
 
 ### backend.py
@@ -113,12 +116,24 @@ Config validation
 
 ## OCR Engine Behavior
 
-- Engine: **PaddleOCR** (`ANPR_OCR_ENGINE=paddleocr`)
+- Engine: **PaddleOCR 2.x legacy API** (`paddleocr<3` in `requirements.txt`)
+- Initialization: `PaddleOCR(use_angle_cls=False, lang=..., show_log=False)`
+- Inference: `ocr_engine.ocr(image, cls=False)`
 - Loaded once via `load_ocr_engine()` after YOLO models
-- Lazy import; `check-config` can warn if package missing
-- Initialization failure writes failed `worker_summary.json` with `stop_reason: runtime_error`
+- Standard `check-config` uses lightweight package detection only (`importlib.util.find_spec`)
+- Runtime `load_ocr_engine()` performs the full import and must fail clearly on error
+- Initialization failure writes failed `worker_summary.json` with `ocr_engine_loaded: false`
 - Runtime does not implement custom model downloads
 - OCR inference failures raise `SourceRuntimeError` and write failed summary
+
+## Plate Candidate Handoff
+
+Valid `PlateCandidate` objects are returned from `_process_plate_detection()` and collected in memory:
+
+- Per-frame: `frame_candidates` list during processed frames
+- Per-run: `self._run_candidates` on `ANPRProcessor`
+
+Candidates are **not** written to `events.jsonl`. Summary exposes counts only (`plate_candidates`).
 
 ## Plate Crop Extraction
 
@@ -234,7 +249,8 @@ Preserves existing commands and RTSP credential safety. Successful dry-run print
 
 - No tracking or event finalization
 - Malaysian pattern is conservative; special plates not covered
-- PaddleOCR may require local model files on first use (outside runtime download logic)
+- PaddleOCR 2.x may require local model files on first use (outside runtime download logic)
+- Use Python 3.11 or 3.12 in a clean virtual environment for reproducible installs
 - Low-quality crops may yield zero valid candidates without crashing
 - No evidence images saved
 
