@@ -107,6 +107,7 @@ class TrackState:
     best_full_frame: np.ndarray | None = None
     best_annotated_frame: np.ndarray | None = None
     best_confidence: float = 0.0
+    decision_finalized: bool = False
     finalized: bool = False
     finalization_reason: str | None = None
 
@@ -286,18 +287,24 @@ def match_detection_to_track(
     detection: Detection,
     tracks: dict[int, TrackState],
     iou_threshold: float,
+    exclude_track_ids: set[int] | None = None,
 ) -> TrackState | None:
-    """Return the best non-finalized track matching a detection by IoU."""
+    """Return the best matchable track for a detection by IoU (one-to-one per frame)."""
+    exclude_track_ids = exclude_track_ids or set()
     best_track: TrackState | None = None
     best_iou = 0.0
     for track in tracks.values():
+        if track.track_id in exclude_track_ids:
+            continue
         if track.finalized:
             continue
-        iou = calculate_iou(detection.bbox, track.bbox)
-        if iou >= iou_threshold and iou > best_iou:
+        iou = calculate_iou(track.bbox, detection.bbox)
+        if iou > best_iou:
             best_iou = iou
             best_track = track
-    return best_track
+    if best_track is not None and best_iou >= iou_threshold:
+        return best_track
+    return None
 
 
 def create_track(
@@ -605,24 +612,33 @@ class ANPRProcessor:
         packet: FramePacket,
         metrics: RuntimeMetrics,
     ) -> list[tuple[TrackState, Detection]]:
-        """Match vehicle detections to tracks via IoU and create new tracks when needed."""
+        """Match vehicle detections to tracks via IoU (one track per detection per frame)."""
         matched: list[tuple[TrackState, Detection]] = []
-        for detection in vehicle_detections:
+        assigned_track_ids: set[int] = set()
+        sorted_detections = sorted(
+            vehicle_detections,
+            key=lambda detection: detection.confidence,
+            reverse=True,
+        )
+        for detection in sorted_detections:
             track = match_detection_to_track(
                 detection,
                 self._tracks,
                 self.config.track_iou_threshold,
+                exclude_track_ids=assigned_track_ids,
             )
             if track is not None:
                 track.bbox = detection.bbox
                 track.last_seen_at = packet.timestamp
                 track.last_frame_index = packet.frame_index
                 metrics.tracks_updated += 1
+                assigned_track_ids.add(track.track_id)
             else:
                 track = create_track(detection, packet, self._next_track_id)
                 self._tracks[track.track_id] = track
                 self._next_track_id += 1
                 metrics.tracks_created += 1
+                assigned_track_ids.add(track.track_id)
             matched.append((track, detection))
         metrics.active_tracks = sum(
             1 for track in self._tracks.values() if not track.finalized
@@ -638,6 +654,8 @@ class ANPRProcessor:
         metrics: RuntimeMetrics,
     ) -> None:
         """Append a validated plate candidate to a track vote buffer and evidence state."""
+        if track.decision_finalized:
+            return
         vote = PlateVote(
             plate_text=candidate.normalized_text,
             raw_text=candidate.raw_text,
@@ -669,7 +687,7 @@ class ANPRProcessor:
         packet: FramePacket,
     ) -> tuple[bool, str | None]:
         """Return True when early high-confidence voting criteria are met."""
-        if track.finalized or not track.plate_votes:
+        if track.decision_finalized or track.finalized or not track.plate_votes:
             return False, None
 
         groups: dict[str, list[PlateVote]] = {}
@@ -698,14 +716,15 @@ class ANPRProcessor:
         metrics: RuntimeMetrics,
     ) -> FinalizedTrackCandidate | None:
         """Finalize a track once using vote-buffer majority selection."""
-        if track.finalized:
+        if track.decision_finalized or track.finalized:
             return None
 
         selection = select_best_plate_for_track(track)
         if selection is None:
-            track.finalized = True
-            track.finalization_reason = reason
-            metrics.track_finalizations_rejected += 1
+            if reason in {"track_expired", "source_end"}:
+                track.finalized = True
+                track.finalization_reason = reason
+                metrics.track_finalizations_rejected += 1
             return None
 
         plate_number, confidence, vote_count = selection
@@ -717,8 +736,11 @@ class ANPRProcessor:
                 metrics.track_finalizations_rejected += 1
             return None
 
-        track.finalized = True
+        track.decision_finalized = True
         track.finalization_reason = reason
+        if reason in {"track_expired", "source_end"}:
+            track.finalized = True
+
         metrics.tracks_finalized += 1
         if reason == "early_high_confidence":
             metrics.tracks_finalized_early += 1
@@ -739,6 +761,14 @@ class ANPRProcessor:
         self._finalized_track_candidates.append(finalized)
         return finalized
 
+    def _retire_track(self, track: TrackState, reason: str) -> None:
+        """Retire a track from matching without creating a duplicate candidate."""
+        if track.finalized:
+            return
+        track.finalized = True
+        if track.finalization_reason is None:
+            track.finalization_reason = reason
+
     def finalize_expired_tracks(
         self,
         packet: FramePacket,
@@ -751,6 +781,9 @@ class ANPRProcessor:
             elapsed = packet.timestamp - track.last_seen_at
             if elapsed < self.config.track_expiry_seconds:
                 continue
+            if track.decision_finalized:
+                self._retire_track(track, "track_expired")
+                continue
             self.finalize_track(track, "track_expired", metrics)
 
     def finalize_active_tracks_at_source_end(
@@ -762,6 +795,9 @@ class ANPRProcessor:
         for track in list(self._tracks.values()):
             if track.finalized:
                 continue
+            if track.decision_finalized:
+                self._retire_track(track, "source_end")
+                continue
             self.finalize_track(track, "source_end", metrics)
 
     def _check_early_finalization(
@@ -770,7 +806,7 @@ class ANPRProcessor:
         metrics: RuntimeMetrics,
     ) -> None:
         for track in self._tracks.values():
-            if track.finalized:
+            if track.finalized or track.decision_finalized:
                 continue
             should_finalize, reason = self.should_finalize_track(track, packet)
             if should_finalize and reason:
@@ -975,6 +1011,13 @@ class ANPRProcessor:
 
         return True
 
+    def _packet_timestamp(self, frame_index: int) -> float:
+        """Return frame timestamp for tracking; video uses source timeline."""
+        if self.config.source == "video":
+            fps = self._source_fps or self._assumed_source_fps or ASSUMED_VIDEO_FPS
+            return frame_index / fps
+        return time.time()
+
     def _iter_image_frames(self) -> Iterator[FramePacket]:
         path = self.config.image_path
         image = cv2.imread(path)
@@ -1027,7 +1070,7 @@ class ANPRProcessor:
 
             packet = FramePacket(
                 frame_index=frame_index,
-                timestamp=time.time(),
+                timestamp=self._packet_timestamp(frame_index),
                 image=frame,
                 source_type=source_type,
                 source_path=source_path,

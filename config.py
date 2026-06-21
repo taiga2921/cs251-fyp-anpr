@@ -409,9 +409,9 @@ def _validate_inference(config: Config, result: ValidationResult) -> None:
         result.add_error(
             f"ANPR_EARLY_FINALIZE_MIN_VOTES must be >= 1; got {config.early_finalize_min_votes}."
         )
-    if not 0.0 <= config.early_finalize_min_confidence <= 1.0:
+    if not 0.0 < config.early_finalize_min_confidence <= 1.0:
         result.add_error(
-            "ANPR_EARLY_FINALIZE_MIN_CONFIDENCE must be between 0 and 1; "
+            "ANPR_EARLY_FINALIZE_MIN_CONFIDENCE must be > 0 and <= 1; "
             f"got {config.early_finalize_min_confidence}."
         )
     if config.min_plate_votes < 1:

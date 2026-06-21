@@ -106,8 +106,9 @@ Config validation
 | `best_full_frame` | Full frame copy at best confidence |
 | `best_annotated_frame` | Annotated frame copy with boxes and labels |
 | `best_confidence` | Confidence of best evidence state |
-| `finalized` | Whether the track has been finalized |
-| `finalization_reason` | Reason string when finalized |
+| `decision_finalized` | Track already produced a `FinalizedTrackCandidate` |
+| `finalized` | Track retired from matching (expiry or source end) |
+| `finalization_reason` | Reason string when finalized or decision finalized |
 
 ## PlateVote Contract
 
@@ -123,15 +124,31 @@ Each valid `PlateCandidate` added to a track becomes a `PlateVote`:
 ## IoU Tracking Behavior
 
 - Tracks are stored in `ANPRProcessor._tracks`.
-- Each vehicle detection is matched to the best **non-finalized** track by IoU.
+- Each frame sorts vehicle detections by confidence (descending) before matching.
+- Each vehicle detection is matched to the best **matchable** track by IoU.
+- **One-to-one assignment:** each track can be assigned to at most one detection per frame via `assigned_track_ids` and `exclude_track_ids` in `match_detection_to_track()`.
 - If best IoU ≥ `ANPR_TRACK_IOU_THRESHOLD`, the existing `track_id` is retained.
 - Otherwise a new track is created with an incrementing `track_id`.
 - Matched tracks update `bbox`, `last_seen_at`, and `last_frame_index`.
+- Tracks with `finalized=True` are retired and excluded from matching.
+- Tracks with `decision_finalized=True` but not yet retired remain matchable after early finalization.
 - No external tracking libraries are used.
+
+## Frame Timestamps and Track Expiry
+
+| Source | `FramePacket.timestamp` | Expiry basis |
+| ------ | ------------------------- | ------------ |
+| Video | `frame_index / source_fps` (or assumed FPS) | Video/source timeline |
+| Image | Wall-clock (`time.time()`) | Source-end flush |
+| RTSP / webcam | Wall-clock (`time.time()`) | Wall-clock expiry |
+
+`ANPR_TRACK_EXPIRY_SECONDS` compares `packet.timestamp - track.last_seen_at`. Video offline runs therefore expire by video time, not decode/processing wall clock.
+
+`--max-seconds` remains wall-clock based for runtime limits.
 
 ## Vote Buffer Behavior
 
-- Valid `PlateCandidate` objects are appended to the matched track’s `plate_votes`.
+- Valid `PlateCandidate` objects are appended to the matched track’s `plate_votes` unless `decision_finalized=True`.
 - Votes are grouped by normalized `plate_text`.
 - `select_best_plate_for_track()` chooses the winner deterministically:
 
@@ -149,12 +166,15 @@ Each valid `PlateCandidate` added to a track becomes a `PlateVote`:
 | ------- | ------ | ------------- |
 | Track not seen for `ANPR_TRACK_EXPIRY_SECONDS` | `track_expired` | `ANPR_MIN_PLATE_VOTES` |
 | Source end (last frame) | `source_end` | `1` for image; `ANPR_MIN_PLATE_VOTES` otherwise |
-| Same plate reaches early vote/confidence thresholds | `early_high_confidence` | `ANPR_EARLY_FINALIZE_MIN_VOTES` with avg confidence ≥ `ANPR_EARLY_FINALIZE_MIN_CONFIDENCE` |
+| Same plate reaches early vote/confidence thresholds | `early_high_confidence` | `ANPR_EARLY_FINALIZE_MIN_VOTES` with avg confidence ≥ `ANPR_EARLY_FINALIZE_MIN_CONFIDENCE` (> 0, ≤ 1) |
 
 Rules:
 
-- Tracks with **zero** valid votes are not finalized as candidates; they are marked finalized with `track_finalizations_rejected` incremented.
-- A finalized track cannot finalize again.
+- Tracks with **zero** valid votes are not finalized as candidates; they are retired with `track_finalizations_rejected` incremented.
+- `decision_finalized=True` means a `FinalizedTrackCandidate` was created; no duplicate candidate is produced.
+- After early finalization, the track **remains matchable** so the same visible vehicle does not spawn a duplicate track/candidate.
+- No further OCR votes are added after `decision_finalized=True`.
+- Tracks are **retired** (`finalized=True`) on expiry or source end; early-finalized tracks are retired without creating another candidate.
 - `FinalizedTrackCandidate` objects are stored in `self._finalized_track_candidates` only.
 
 ## Best Evidence State Behavior
@@ -242,6 +262,13 @@ Expected:
 - Image/video runs include M5 tracking and vote metrics in summary and log
 - `events.jsonl` is empty
 - RTSP `--source-path` is rejected
+
+## Configuration Validation
+
+- `ANPR_TRACK_IOU_THRESHOLD` must be > 0 and ≤ 1.
+- `ANPR_EARLY_FINALIZE_MIN_CONFIDENCE` must be > 0 and ≤ 1 (0.0 is rejected).
+- `ANPR_TRACK_EXPIRY_SECONDS` must be > 0.
+- `ANPR_EARLY_FINALIZE_MIN_VOTES` and `ANPR_MIN_PLATE_VOTES` must be ≥ 1.
 
 ## Known Limitations
 
