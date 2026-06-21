@@ -95,7 +95,7 @@ class ANPRProcessor:
             return f"webcam index {self.config.camera_index}"
         if self.config.source == "rtsp":
             return "RTSP stream (ANPR_RTSP_URL)"
-        source_path = self.config.resolved_source_path()
+        source_path = self._safe_source_path()
         return source_path or self.config.source
 
     def open_source(self) -> None:
@@ -192,7 +192,7 @@ class ANPRProcessor:
             raise SourceRuntimeError("Video capture is not open.")
 
         source_type = self.config.source
-        source_path = self.config.resolved_source_path()
+        source_path = self._safe_source_path()
         start_time = time.time()
         frame_index = 0
         pending: FramePacket | None = None
@@ -244,6 +244,17 @@ class ANPRProcessor:
             raise SourceRuntimeError("Source is not open.")
         yield from self._iter_capture_frames()
 
+    def _safe_source_path(self) -> str | None:
+        if self.config.source == "rtsp":
+            return "ANPR_RTSP_URL"
+        if self.config.source == "video":
+            return self.config.video_path
+        if self.config.source == "image":
+            return self.config.image_path
+        if self.config.source == "webcam":
+            return str(self.config.camera_index)
+        return None
+
     def _build_summary(
         self,
         run_dir: Path,
@@ -253,7 +264,7 @@ class ANPRProcessor:
         strict: bool,
         status: str,
     ) -> dict:
-        source_path = self.config.resolved_source_path()
+        source_path = self._safe_source_path()
         warnings = list(validation_result.warnings) + list(metrics.runtime_warnings)
         summary: dict = {
             "status": status,
