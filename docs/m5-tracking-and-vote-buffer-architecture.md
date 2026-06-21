@@ -73,7 +73,7 @@ Config validation
         |
         +--> update_tracks() via IoU
         |
-        +--> detect_plates() per matched track/vehicle
+        +--> detect_plates() per matched track/vehicle unless decision_finalized=True
         |
         +--> OCR → PlateCandidate
         |
