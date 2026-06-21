@@ -262,12 +262,15 @@ class ANPRProcessor:
         start = time.perf_counter()
         metrics.vehicle_detection_calls += 1
 
-        results = self._vehicle_model.predict(
-            frame,
-            conf=self.config.vehicle_conf,
-            device=self.config.device,
-            verbose=False,
-        )
+        try:
+            results = self._vehicle_model.predict(
+                frame,
+                conf=self.config.vehicle_conf,
+                device=self.config.device,
+                verbose=False,
+            )
+        except Exception as exc:
+            raise SourceRuntimeError(f"Vehicle detection failed: {exc}") from exc
         detections = self._parse_yolo_results(
             results,
             width,
@@ -306,12 +309,15 @@ class ANPRProcessor:
         start = time.perf_counter()
         metrics.plate_detection_calls += 1
 
-        results = self._plate_model.predict(
-            inference_image,
-            conf=self.config.plate_conf,
-            device=self.config.device,
-            verbose=False,
-        )
+        try:
+            results = self._plate_model.predict(
+                inference_image,
+                conf=self.config.plate_conf,
+                device=self.config.device,
+                verbose=False,
+            )
+        except Exception as exc:
+            raise SourceRuntimeError(f"Plate detection failed: {exc}") from exc
         detections = self._parse_yolo_results(
             results,
             width,

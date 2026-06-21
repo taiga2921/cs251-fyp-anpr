@@ -14,6 +14,9 @@ runs/*
 
 samples/videos/*
 !samples/videos/.gitkeep
+!samples/videos/document_6177158287369184218.mp4
 
 samples/images/*
 !samples/images/.gitkeep
+!samples/images/photo_6177158287829176211_w.jpg
+!samples/images/photo_6177158287829176212_w.jpg

@@ -175,8 +175,8 @@ M2 fields preserved: `stop_reason`, `max_seconds` (always present), `source_fps`
 ```bash
 python main.py check-config
 python main.py check-config --strict
-python main.py run --source image --image samples/images/frame.jpg --dry-run --strict
-python main.py run --source video --video samples/videos/test_vehicle.mp4 --dry-run --strict
+python main.py run --source image --image samples/images/photo_6177158287829176211_w.jpg --dry-run --strict
+python main.py run --source video --video samples/videos/document_6177158287369184218.mp4 --dry-run --strict
 python main.py run --source rtsp --max-seconds 2 --dry-run --strict
 python main.py run --source webcam --camera-index 0 --dry-run --max-seconds 2 --strict
 python main.py flush-backend-queue
@@ -211,8 +211,9 @@ RTSP via CLI `--source-path` remains **rejected**.
 - [ ] `python -m py_compile main.py config.py anpr.py backend.py`
 - [ ] `python main.py check-config`
 - [ ] `python main.py check-config --strict` (requires both model files)
-- [ ] `python main.py run --source image --image samples/images/frame.jpg --dry-run --strict`
+- [ ] `python main.py run --source image --image samples/images/photo_6177158287829176211_w.jpg --dry-run --strict`
 - [ ] `python main.py run --source-path rtsp://... --dry-run` → rejected
+- [ ] Confirm failed model/detection runs still write `worker_summary.json`
 - [ ] Confirm detection metrics in `worker_summary.json`
 - [ ] Confirm `events.jsonl` is empty
 
@@ -221,6 +222,8 @@ RTSP via CLI `--source-path` remains **rejected**.
 - No OCR, tracking, events, evidence, or backend I/O
 - No model auto-download
 - Both model files must exist locally for `--strict` dry runs
+- Vehicle or plate inference failures must write a failed summary with `stop_reason: runtime_error`
+- Demo sample images and video are committed; other files under `samples/` remain git-ignored
 - First Ultralytics import may be slow; not a benchmark subsystem
 - Webcam/RTSP depend on local hardware/network
 
