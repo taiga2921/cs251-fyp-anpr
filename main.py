@@ -1,0 +1,167 @@
+"""CLI entry point for AI ANPR (M2)."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from anpr import ANPRProcessor
+from backend import BackendClient
+from config import Config, format_validation_output, validate_config
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ai-anpr",
+        description="AI ANPR CLI — M2 source reader and frame scheduler",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    check_parser = subparsers.add_parser(
+        "check-config",
+        help="Validate configuration, sources, models, and backend settings",
+    )
+    check_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Require configured model files to exist",
+    )
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run ANPR processing (M2 supports --dry-run with real source reading)",
+    )
+    run_parser.add_argument(
+        "--source",
+        choices=["rtsp", "video", "image", "webcam"],
+        help="Input source type",
+    )
+    run_parser.add_argument(
+        "--source-path",
+        help="Generic source path (RTSP URL, video file, or image file)",
+    )
+    run_parser.add_argument(
+        "--video",
+        help="Path to a video file",
+    )
+    run_parser.add_argument(
+        "--image",
+        help="Path to an image file",
+    )
+    run_parser.add_argument(
+        "--camera-index",
+        type=int,
+        help="Webcam camera index",
+    )
+    run_parser.add_argument(
+        "--max-seconds",
+        type=float,
+        help="Maximum processing duration in seconds",
+    )
+    run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Read configured source, apply frame scheduling, and write run output",
+    )
+    run_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Require configured model files to exist",
+    )
+
+    subparsers.add_parser(
+        "flush-backend-queue",
+        help="Flush pending backend queue items (M1 placeholder)",
+    )
+
+    return parser
+
+
+def _print_validation_result(title: str, result) -> None:
+    print(title)
+    print("-" * 40)
+    print(format_validation_output(result))
+    print("-" * 40)
+    if result.warnings:
+        print(f"Warnings: {len(result.warnings)}")
+    if result.errors:
+        print(f"Errors: {len(result.errors)}")
+        print("FAILURE: configuration validation failed.")
+    elif result.warnings:
+        print("SUCCESS: configuration is valid with warnings.")
+    else:
+        print("SUCCESS: configuration is valid.")
+
+
+def cmd_check_config(config: Config, args: argparse.Namespace) -> int:
+    result = validate_config(config, strict=args.strict)
+    _print_validation_result("Configuration check", result)
+    return 0 if result.ok else 1
+
+
+def cmd_run(config: Config, args: argparse.Namespace) -> int:
+    config.apply_cli_overrides(args)
+
+    if not args.dry_run:
+        print(
+            "Non-dry-run ANPR execution is not implemented until later milestones.\n"
+            "Use --dry-run to validate configuration and create placeholder run output."
+        )
+        return 2
+
+    result = validate_config(config, strict=args.strict)
+    if not result.ok:
+        print("Configuration validation failed before dry-run:")
+        print(format_validation_output(result))
+        return 1
+
+    processor = ANPRProcessor(config)
+    dry_run = processor.run_dry_run(result, strict=args.strict)
+
+    if dry_run.summary.get("status") == "failed":
+        error = dry_run.summary.get("errors", ["Unknown runtime error"])
+        print(f"ERROR: {error[0] if error else 'Dry-run failed.'}")
+        print(f"Run directory: {dry_run.run_dir}")
+        print(f"Worker log: {dry_run.worker_log}")
+        print(f"Worker summary: {dry_run.worker_summary}")
+        return 1
+
+    print("Dry-run completed successfully.")
+    print(f"Run directory: {dry_run.run_dir}")
+    print(f"Frames read: {dry_run.summary.get('frames_read', 0)}")
+    print(f"Frames processed: {dry_run.summary.get('frames_processed', 0)}")
+    print(f"Worker log: {dry_run.worker_log}")
+    print(f"Worker summary: {dry_run.worker_summary}")
+    print(f"Events file: {dry_run.events_file}")
+    if result.warnings:
+        print(f"Warnings ({len(result.warnings)}):")
+        for warning in result.warnings:
+            print(f"  - {warning}")
+    return 0
+
+
+def cmd_flush_backend_queue() -> int:
+    client = BackendClient()
+    flush_result = client.flush_queue()
+    print(flush_result.message)
+    return 0 if flush_result.success else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    config = Config.from_env()
+
+    if args.command == "check-config":
+        return cmd_check_config(config, args)
+    if args.command == "run":
+        return cmd_run(config, args)
+    if args.command == "flush-backend-queue":
+        return cmd_flush_backend_queue()
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

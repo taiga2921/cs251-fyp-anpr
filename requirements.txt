@@ -1,0 +1,3 @@
+# M2 — source reading and frame scheduling
+opencv-python
+numpy
