@@ -1,4 +1,4 @@
-"""ANPR runtime with M2 source reader and frame scheduler."""
+"""ANPR runtime with M3 model loading and detector architecture."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -16,6 +17,7 @@ import numpy as np
 from config import Config, ValidationResult
 
 ASSUMED_VIDEO_FPS = 30.0
+VEHICLE_CLASS_NAMES = frozenset({"car", "motorcycle", "bus", "truck"})
 
 
 class SourceRuntimeError(Exception):
@@ -24,6 +26,10 @@ class SourceRuntimeError(Exception):
     def __init__(self, message: str) -> None:
         self.message = message
         super().__init__(message)
+
+
+class ModelLoadError(SourceRuntimeError):
+    """Raised when configured models cannot be loaded."""
 
 
 @dataclass
@@ -36,6 +42,16 @@ class FramePacket:
     source_type: str
     source_path: str | None
     is_last: bool = False
+
+
+@dataclass
+class Detection:
+    """Normalized detection result in full-frame coordinates."""
+
+    bbox: tuple[int, int, int, int]
+    confidence: float
+    class_id: int | None = None
+    class_name: str | None = None
 
 
 @dataclass
@@ -54,6 +70,16 @@ class RuntimeMetrics:
     runtime_error: str | None = None
     runtime_warnings: list[str] = field(default_factory=list)
     log_lines: list[str] = field(default_factory=list)
+    models_loaded: bool = False
+    vehicle_model: str = ""
+    plate_model: str = ""
+    device: str = "cpu"
+    vehicle_detection_calls: int = 0
+    plate_detection_calls: int = 0
+    vehicle_detections: int = 0
+    plate_detections: int = 0
+    vehicle_detect_ms_total: float = 0.0
+    plate_detect_ms_total: float = 0.0
 
 
 @dataclass
@@ -71,8 +97,25 @@ def _fps_is_valid(raw_fps: float) -> bool:
     return raw_fps > 0 and math.isfinite(raw_fps) and not math.isnan(raw_fps)
 
 
+def _clip_bbox(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int] | None:
+    ix1 = max(0, int(round(x1)))
+    iy1 = max(0, int(round(y1)))
+    ix2 = min(width, int(round(x2)))
+    iy2 = min(height, int(round(y2)))
+    if ix2 <= ix1 or iy2 <= iy1:
+        return None
+    return ix1, iy1, ix2, iy2
+
+
 class ANPRProcessor:
-    """ANPR processor with M2 source reading and frame scheduling."""
+    """ANPR processor with source reading, scheduling, and YOLO detection."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -83,6 +126,9 @@ class ANPRProcessor:
         self._use_wall_clock: bool = False
         self._last_processed_time: float | None = None
         self._stop_reason: str = "unknown"
+        self._vehicle_model: Any = None
+        self._plate_model: Any = None
+        self._models_loaded: bool = False
 
     def _make_run_dir(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -97,6 +143,186 @@ class ANPRProcessor:
             return "RTSP stream (ANPR_RTSP_URL)"
         source_path = self._safe_source_path()
         return source_path or self.config.source
+
+    def _safe_source_path(self) -> str | None:
+        if self.config.source == "rtsp":
+            return "ANPR_RTSP_URL"
+        if self.config.source == "video":
+            return self.config.video_path
+        if self.config.source == "image":
+            return self.config.image_path
+        if self.config.source == "webcam":
+            return str(self.config.camera_index)
+        return None
+
+    def _ensure_device_available(self) -> None:
+        if self.config.device != "cuda":
+            return
+        try:
+            import torch
+        except ImportError as exc:
+            raise ModelLoadError(
+                "ANPR_DEVICE=cuda but PyTorch is not available."
+            ) from exc
+        if not torch.cuda.is_available():
+            raise ModelLoadError(
+                "ANPR_DEVICE=cuda but CUDA is not available on this system. "
+                "Use ANPR_DEVICE=cpu."
+            )
+
+    def load_models(self, metrics: RuntimeMetrics) -> None:
+        """Load vehicle and plate YOLO models once per runtime."""
+        vehicle_path = Path(self.config.vehicle_model)
+        plate_path = Path(self.config.plate_model)
+
+        if not vehicle_path.is_file():
+            raise ModelLoadError(
+                f"Vehicle model file not found: {self.config.vehicle_model}"
+            )
+        if not plate_path.is_file():
+            raise ModelLoadError(
+                f"Plate model file not found: {self.config.plate_model}"
+            )
+
+        self._ensure_device_available()
+        metrics.log_lines.append("Model loading started.")
+
+        try:
+            from ultralytics import YOLO
+
+            self._vehicle_model = YOLO(str(vehicle_path))
+            metrics.log_lines.append(f"Vehicle model loaded: {self.config.vehicle_model}")
+            self._plate_model = YOLO(str(plate_path))
+            metrics.log_lines.append(f"Plate model loaded: {self.config.plate_model}")
+        except Exception as exc:
+            raise ModelLoadError(f"Failed to load YOLO models: {exc}") from exc
+
+        self._models_loaded = True
+        metrics.models_loaded = True
+        metrics.vehicle_model = self.config.vehicle_model
+        metrics.plate_model = self.config.plate_model
+        metrics.device = self.config.device
+        metrics.log_lines.append(f"Device: {self.config.device}")
+
+    def _parse_yolo_results(
+        self,
+        results: Any,
+        frame_width: int,
+        frame_height: int,
+        *,
+        filter_vehicles: bool = False,
+        offset_x: int = 0,
+        offset_y: int = 0,
+    ) -> list[Detection]:
+        detections: list[Detection] = []
+        for result in results:
+            boxes = result.boxes
+            if boxes is None:
+                continue
+            names: dict[int, str] = result.names or {}
+            for box in boxes:
+                confidence = float(box.conf[0].item())
+                class_id = int(box.cls[0].item()) if box.cls is not None else None
+                class_name = names.get(class_id) if class_id is not None else None
+                if filter_vehicles and class_name is not None:
+                    if class_name.lower() not in VEHICLE_CLASS_NAMES:
+                        continue
+
+                xyxy = box.xyxy[0].tolist()
+                bbox = _clip_bbox(
+                    xyxy[0] + offset_x,
+                    xyxy[1] + offset_y,
+                    xyxy[2] + offset_x,
+                    xyxy[3] + offset_y,
+                    frame_width,
+                    frame_height,
+                )
+                if bbox is None:
+                    continue
+                detections.append(
+                    Detection(
+                        bbox=bbox,
+                        confidence=confidence,
+                        class_id=class_id,
+                        class_name=class_name,
+                    )
+                )
+        return detections
+
+    def detect_vehicles(
+        self,
+        frame: np.ndarray,
+        metrics: RuntimeMetrics,
+    ) -> list[Detection]:
+        """Run vehicle detection on a full frame."""
+        if not self._models_loaded or self._vehicle_model is None:
+            raise ModelLoadError("Vehicle model is not loaded.")
+
+        height, width = frame.shape[:2]
+        start = time.perf_counter()
+        metrics.vehicle_detection_calls += 1
+
+        results = self._vehicle_model.predict(
+            frame,
+            conf=self.config.vehicle_conf,
+            device=self.config.device,
+            verbose=False,
+        )
+        detections = self._parse_yolo_results(
+            results,
+            width,
+            height,
+            filter_vehicles=True,
+        )
+
+        metrics.vehicle_detections += len(detections)
+        metrics.vehicle_detect_ms_total += (time.perf_counter() - start) * 1000.0
+        return detections
+
+    def detect_plates(
+        self,
+        frame: np.ndarray,
+        vehicle_detection: Detection | None,
+        metrics: RuntimeMetrics,
+    ) -> list[Detection]:
+        """Run plate detection on a vehicle crop or the full frame."""
+        if not self._models_loaded or self._plate_model is None:
+            raise ModelLoadError("Plate model is not loaded.")
+
+        height, width = frame.shape[:2]
+        offset_x = 0
+        offset_y = 0
+        inference_image = frame
+
+        if vehicle_detection is not None:
+            x1, y1, x2, y2 = vehicle_detection.bbox
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                return []
+            inference_image = crop
+            offset_x = x1
+            offset_y = y1
+
+        start = time.perf_counter()
+        metrics.plate_detection_calls += 1
+
+        results = self._plate_model.predict(
+            inference_image,
+            conf=self.config.plate_conf,
+            device=self.config.device,
+            verbose=False,
+        )
+        detections = self._parse_yolo_results(
+            results,
+            width,
+            height,
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
+
+        metrics.plate_detections += len(detections)
+        metrics.plate_detect_ms_total += (time.perf_counter() - start) * 1000.0
+        return detections
 
     def open_source(self) -> None:
         """Open the configured source and initialize scheduler state."""
@@ -244,16 +470,10 @@ class ANPRProcessor:
             raise SourceRuntimeError("Source is not open.")
         yield from self._iter_capture_frames()
 
-    def _safe_source_path(self) -> str | None:
-        if self.config.source == "rtsp":
-            return "ANPR_RTSP_URL"
-        if self.config.source == "video":
-            return self.config.video_path
-        if self.config.source == "image":
-            return self.config.image_path
-        if self.config.source == "webcam":
-            return str(self.config.camera_index)
-        return None
+    def _average_ms(self, total_ms: float, calls: int) -> float:
+        if calls <= 0:
+            return 0.0
+        return round(total_ms / calls, 3)
 
     def _build_summary(
         self,
@@ -264,13 +484,12 @@ class ANPRProcessor:
         strict: bool,
         status: str,
     ) -> dict:
-        source_path = self._safe_source_path()
         warnings = list(validation_result.warnings) + list(metrics.runtime_warnings)
         summary: dict = {
             "status": status,
-            "milestone": "M2",
+            "milestone": "M3",
             "source_type": self.config.source,
-            "source_path": source_path,
+            "source_path": self._safe_source_path(),
             "frames_read": metrics.frames_read,
             "frames_processed": metrics.frames_processed,
             "events_finalized": 0,
@@ -287,6 +506,22 @@ class ANPRProcessor:
             "stop_reason": metrics.stop_reason,
             "max_seconds": self.config.max_seconds,
             "duration_seconds": round(metrics.duration_seconds, 3),
+            "models_loaded": metrics.models_loaded,
+            "vehicle_model": metrics.vehicle_model or self.config.vehicle_model,
+            "plate_model": metrics.plate_model or self.config.plate_model,
+            "device": metrics.device or self.config.device,
+            "vehicle_detection_calls": metrics.vehicle_detection_calls,
+            "plate_detection_calls": metrics.plate_detection_calls,
+            "vehicle_detections": metrics.vehicle_detections,
+            "plate_detections": metrics.plate_detections,
+            "average_vehicle_detect_ms": self._average_ms(
+                metrics.vehicle_detect_ms_total,
+                metrics.vehicle_detection_calls,
+            ),
+            "average_plate_detect_ms": self._average_ms(
+                metrics.plate_detect_ms_total,
+                metrics.plate_detection_calls,
+            ),
         }
         if metrics.assumed_source_fps is not None:
             summary["assumed_source_fps"] = metrics.assumed_source_fps
@@ -342,9 +577,9 @@ class ANPRProcessor:
         strict: bool = False,
     ) -> DryRunResult:
         """
-        Open the configured source, read frames, apply scheduling, and write outputs.
+        Open source, load models, read frames, run detection, and write outputs.
 
-        No models, detection, OCR, tracking, evidence, or backend calls are performed.
+        OCR, tracking, evidence, and backend calls are not performed in M3.
         """
         run_dir = self._make_run_dir()
         validation_mode = "strict" if strict else "standard"
@@ -353,7 +588,7 @@ class ANPRProcessor:
 
         metrics.log_lines.extend(
             [
-                "M2 dry-run started.",
+                "M3 dry-run started.",
                 f"Source type: {self.config.source}",
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
@@ -387,12 +622,17 @@ class ANPRProcessor:
                         "Frame skip interval: wall-clock fallback (source FPS unavailable)"
                     )
 
+            self.load_models(metrics)
+
             for packet in self.iter_frames():
                 metrics.source_opened = True
                 metrics.frames_read += 1
                 if self.should_process_frame(packet):
                     metrics.frames_processed += 1
                     self._last_processed_time = packet.timestamp
+                    vehicles = self.detect_vehicles(packet.image, metrics)
+                    for vehicle in vehicles:
+                        self.detect_plates(packet.image, vehicle, metrics)
 
             metrics.source_completed = True
             self._finalize_stop_reason(metrics)
@@ -410,6 +650,12 @@ class ANPRProcessor:
             [
                 f"Frames read: {metrics.frames_read}",
                 f"Frames processed: {metrics.frames_processed}",
+                f"Vehicle detection calls: {metrics.vehicle_detection_calls}",
+                f"Plate detection calls: {metrics.plate_detection_calls}",
+                f"Vehicle detections: {metrics.vehicle_detections}",
+                f"Plate detections: {metrics.plate_detections}",
+                f"Average vehicle detect ms: {self._average_ms(metrics.vehicle_detect_ms_total, metrics.vehicle_detection_calls)}",
+                f"Average plate detect ms: {self._average_ms(metrics.plate_detect_ms_total, metrics.plate_detection_calls)}",
                 f"Source completed: {metrics.source_completed}",
                 f"Stop reason: {metrics.stop_reason}",
             ]
@@ -419,7 +665,7 @@ class ANPRProcessor:
         metrics.log_lines.extend(
             [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
-                f"M2 dry-run {status}.",
+                f"M3 dry-run {status}.",
             ]
         )
 

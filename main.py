@@ -1,4 +1,4 @@
-"""CLI entry point for AI ANPR (M2)."""
+"""CLI entry point for AI ANPR (M3)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-anpr",
-        description="AI ANPR CLI — M2 source reader and frame scheduler",
+        description="AI ANPR CLI — M3 model loading and detector architecture",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -29,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run ANPR processing (M2 supports --dry-run with real source reading)",
+        help="Run ANPR processing (M3 supports --dry-run with source reading and detection)",
     )
     run_parser.add_argument(
         "--source",
@@ -61,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Read configured source, apply frame scheduling, and write run output",
+        help="Open source, load models, schedule frames, run detection, and write run output",
     )
     run_parser.add_argument(
         "--strict",
@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "flush-backend-queue",
-        help="Flush pending backend queue items (M2 placeholder; no network activity)",
+        help="Flush pending backend queue items (placeholder; no network activity)",
     )
 
     return parser
@@ -109,7 +109,7 @@ def cmd_run(config: Config, args: argparse.Namespace) -> int:
     if not args.dry_run:
         print(
             "Non-dry-run ANPR execution is not implemented until later milestones.\n"
-            "Use --dry-run to validate configuration and create placeholder run output."
+            "Use --dry-run to open the source, load models, and run detection."
         )
         return 2
 
@@ -134,6 +134,8 @@ def cmd_run(config: Config, args: argparse.Namespace) -> int:
     print(f"Run directory: {dry_run.run_dir}")
     print(f"Frames read: {dry_run.summary.get('frames_read', 0)}")
     print(f"Frames processed: {dry_run.summary.get('frames_processed', 0)}")
+    print(f"Vehicle detections: {dry_run.summary.get('vehicle_detections', 0)}")
+    print(f"Plate detections: {dry_run.summary.get('plate_detections', 0)}")
     print(f"Worker log: {dry_run.worker_log}")
     print(f"Worker summary: {dry_run.worker_summary}")
     print(f"Events file: {dry_run.events_file}")

@@ -1,3 +1,4 @@
-# M2 — source reading and frame scheduling
+# M3 — model loading and YOLO detection
 opencv-python
 numpy
+ultralytics
