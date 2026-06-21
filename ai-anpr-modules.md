@@ -286,7 +286,7 @@ ANPR_VIDEO_PATH=samples/videos/test_vehicle.mp4
 ANPR_IMAGE_PATH=samples/images/frame.jpg
 ANPR_CAMERA_INDEX=0
 
-ANPR_VEHICLE_MODEL=yolo11s.pt
+ANPR_VEHICLE_MODEL=models/vehicle/yolo11s.pt
 ANPR_PLATE_MODEL=models/plate/license-plate-finetune-v1s.pt
 ANPR_DEVICE=cpu
 

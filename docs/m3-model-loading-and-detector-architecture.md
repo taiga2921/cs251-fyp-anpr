@@ -149,7 +149,7 @@ Preserves all M2 fields and adds:
 {
   "milestone": "M3",
   "models_loaded": true,
-  "vehicle_model": "yolo11s.pt",
+  "vehicle_model": "models/vehicle/yolo11s.pt",
   "plate_model": "models/plate/license-plate-finetune-v1s.pt",
   "device": "cpu",
   "vehicle_detection_calls": 1,
@@ -188,7 +188,7 @@ RTSP via CLI `--source-path` remains **rejected**.
 
 ## Model File Setup
 
-1. Place vehicle weights at the path configured by `ANPR_VEHICLE_MODEL` (default `yolo11s.pt`).
+1. Place vehicle weights at the path configured by `ANPR_VEHICLE_MODEL` (default `models/vehicle/yolo11s.pt`).
 2. Place plate weights at `models/plate/license-plate-finetune-v1s.pt` (or configured path).
 3. `.pt` files are git-ignored; download manually before running.
 4. Run `python main.py check-config --strict` to verify files exist.

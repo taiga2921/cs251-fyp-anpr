@@ -161,7 +161,7 @@ class Config:
     image_path: str = "samples/images/frame.jpg"
     camera_index: int = 0
 
-    vehicle_model: str = "yolo11s.pt"
+    vehicle_model: str = "models/vehicle/yolo11s.pt"
     plate_model: str = "models/plate/license-plate-finetune-v1s.pt"
     device: str = "cpu"
 
@@ -201,7 +201,7 @@ class Config:
             video_path=parse_path(env.get("ANPR_VIDEO_PATH"), "samples/videos/test_vehicle.mp4"),
             image_path=parse_path(env.get("ANPR_IMAGE_PATH"), "samples/images/frame.jpg"),
             camera_index=parse_int(env.get("ANPR_CAMERA_INDEX"), 0),
-            vehicle_model=parse_path(env.get("ANPR_VEHICLE_MODEL"), "yolo11s.pt"),
+            vehicle_model=parse_path(env.get("ANPR_VEHICLE_MODEL"), "models/vehicle/yolo11s.pt"),
             plate_model=parse_path(env.get("ANPR_PLATE_MODEL"), "models/plate/license-plate-finetune-v1s.pt"),
             device=parse_str(env.get("ANPR_DEVICE"), "cpu"),
             target_fps=parse_float(env.get("ANPR_TARGET_FPS"), 3.0),
