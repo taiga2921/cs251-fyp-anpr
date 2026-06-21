@@ -1,4 +1,4 @@
-"""Backend client placeholder for M1."""
+"""Backend client placeholder for M2."""
 
 from __future__ import annotations
 
@@ -15,14 +15,15 @@ class FlushQueueResult:
 
 
 class BackendClient:
-    """Placeholder backend client with no network side effects in M1."""
+    """Placeholder backend client with no network side effects."""
 
     def flush_queue(self) -> FlushQueueResult:
-        """Report that backend queue flushing is not implemented yet."""
+        """Report that backend integration is not implemented yet."""
         return FlushQueueResult(
             success=True,
             message=(
-                "Backend queue flushing is not implemented in M2. "
+                "Backend queue flushing is not implemented. "
+                "Backend integration begins in a later milestone. "
                 "No queue items were processed."
             ),
             processed=0,

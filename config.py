@@ -1,4 +1,4 @@
-"""Configuration loading and validation for AI ANPR (M1)."""
+"""Configuration loading and validation for AI ANPR."""
 
 from __future__ import annotations
 
@@ -124,11 +124,20 @@ def _merged_env() -> dict[str, str]:
     return merged
 
 
-def infer_source_from_path(source_path: str) -> tuple[str, str]:
-    """Infer source type and normalized path from a generic source path."""
+RTSP_URL_CLI_ERROR = (
+    "RTSP URLs must be configured with ANPR_RTSP_URL in .env or environment variables. "
+    "Use: python main.py run --source rtsp --dry-run"
+)
+
+
+def is_rtsp_source_path(source_path: str) -> bool:
+    """Return True when a CLI source path looks like an RTSP URL."""
     lowered = source_path.strip().lower()
-    if lowered.startswith("rtsp://") or lowered.startswith("rtsps://"):
-        return "rtsp", source_path.strip()
+    return lowered.startswith("rtsp://") or lowered.startswith("rtsps://")
+
+
+def infer_source_from_path(source_path: str) -> tuple[str, str]:
+    """Infer source type and normalized path from a local file path."""
     suffix = Path(source_path).suffix.lower()
     if suffix in IMAGE_EXTENSIONS:
         return "image", source_path.strip()
@@ -239,14 +248,15 @@ class Config:
         if getattr(args, "source", None):
             self.source = args.source
         if getattr(args, "source_path", None):
-            inferred_source, inferred_path = infer_source_from_path(args.source_path)
-            self.source = inferred_source
-            if inferred_source == "rtsp":
-                self.rtsp_url = inferred_path
-            elif inferred_source == "image":
-                self.image_path = inferred_path
+            if is_rtsp_source_path(args.source_path):
+                pass
             else:
-                self.video_path = inferred_path
+                inferred_source, inferred_path = infer_source_from_path(args.source_path)
+                self.source = inferred_source
+                if inferred_source == "image":
+                    self.image_path = inferred_path
+                else:
+                    self.video_path = inferred_path
         if getattr(args, "video", None):
             self.source = "video"
             self.video_path = args.video
@@ -278,7 +288,6 @@ def check_foundation_config(config: Config) -> ValidationResult:
         runs_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         result.add_error(f"Cannot create runs directory {runs_dir}: {exc}")
-        return result
 
     test_file = runs_dir / ".write_test"
     try:
@@ -300,11 +309,13 @@ def _validate_source(config: Config, result: ValidationResult) -> None:
 
     if config.source == "rtsp":
         if not config.rtsp_url.strip():
-            result.add_error("RTSP source requires ANPR_RTSP_URL or --source-path with an RTSP URL.")
+            result.add_error(
+                "RTSP source requires ANPR_RTSP_URL in .env or environment variables."
+            )
         elif not is_plausible_rtsp_url(config.rtsp_url):
-            result.add_error(f"RTSP URL is not plausible: {config.rtsp_url}")
+            result.add_error("RTSP URL is not plausible. Check ANPR_RTSP_URL in .env.")
         else:
-            result.add_info(f"OK: RTSP URL configured: {config.rtsp_url}")
+            result.add_info("OK: RTSP URL configured (ANPR_RTSP_URL)")
 
     elif config.source == "video":
         video_path = Path(config.video_path)
@@ -449,7 +460,7 @@ def _validate_output(config: Config, result: ValidationResult) -> None:
 
 def validate_config(config: Config, *, strict: bool = False) -> ValidationResult:
     """
-    Validate full M1 configuration.
+    Validate full configuration.
 
     In strict mode, missing model files are fatal errors.
     In standard mode, missing model files are warnings.

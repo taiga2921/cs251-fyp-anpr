@@ -15,6 +15,8 @@ import numpy as np
 
 from config import Config, ValidationResult
 
+ASSUMED_VIDEO_FPS = 30.0
+
 
 class SourceRuntimeError(Exception):
     """Raised when a source cannot be opened or read."""
@@ -45,9 +47,12 @@ class RuntimeMetrics:
     source_opened: bool = False
     source_completed: bool = False
     source_fps: float | None = None
+    assumed_source_fps: float | None = None
     frame_skip_interval: int | None = None
+    stop_reason: str = "unknown"
     duration_seconds: float = 0.0
     runtime_error: str | None = None
+    runtime_warnings: list[str] = field(default_factory=list)
     log_lines: list[str] = field(default_factory=list)
 
 
@@ -62,6 +67,10 @@ class DryRunResult:
     summary: dict
 
 
+def _fps_is_valid(raw_fps: float) -> bool:
+    return raw_fps > 0 and math.isfinite(raw_fps) and not math.isnan(raw_fps)
+
+
 class ANPRProcessor:
     """ANPR processor with M2 source reading and frame scheduling."""
 
@@ -69,8 +78,11 @@ class ANPRProcessor:
         self.config = config
         self._capture: cv2.VideoCapture | None = None
         self._source_fps: float | None = None
+        self._assumed_source_fps: float | None = None
         self._frame_skip_interval: int | None = None
+        self._use_wall_clock: bool = False
         self._last_processed_time: float | None = None
+        self._stop_reason: str = "unknown"
 
     def _make_run_dir(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -79,17 +91,22 @@ class ANPRProcessor:
         return run_dir
 
     def _source_label(self) -> str:
-        source_path = self.config.resolved_source_path()
         if self.config.source == "webcam":
             return f"webcam index {self.config.camera_index}"
+        if self.config.source == "rtsp":
+            return "RTSP stream (ANPR_RTSP_URL)"
+        source_path = self.config.resolved_source_path()
         return source_path or self.config.source
 
     def open_source(self) -> None:
         """Open the configured source and initialize scheduler state."""
         self._capture = None
         self._source_fps = None
+        self._assumed_source_fps = None
         self._frame_skip_interval = None
+        self._use_wall_clock = False
         self._last_processed_time = None
+        self._stop_reason = "unknown"
 
         if self.config.source == "image":
             return
@@ -99,7 +116,7 @@ class ANPRProcessor:
             label = f"webcam source: index {self.config.camera_index}"
         elif self.config.source == "rtsp":
             capture = cv2.VideoCapture(self.config.rtsp_url)
-            label = f"RTSP source: {self.config.rtsp_url}"
+            label = "RTSP source (ANPR_RTSP_URL)"
         elif self.config.source == "video":
             capture = cv2.VideoCapture(self.config.video_path)
             label = f"video source: {self.config.video_path}"
@@ -110,12 +127,25 @@ class ANPRProcessor:
             capture.release()
             raise SourceRuntimeError(f"Failed to open {label}")
 
-        raw_fps = capture.get(cv2.CAP_PROP_FPS)
-        if raw_fps and raw_fps > 0 and not math.isnan(raw_fps):
-            self._source_fps = float(raw_fps)
+        raw_fps = float(capture.get(cv2.CAP_PROP_FPS))
+        if self.config.source == "video":
+            if _fps_is_valid(raw_fps):
+                self._source_fps = raw_fps
+                self._frame_skip_interval = max(
+                    1, round(self._source_fps / self.config.target_fps)
+                )
+            else:
+                self._assumed_source_fps = ASSUMED_VIDEO_FPS
+                self._frame_skip_interval = max(
+                    1, round(ASSUMED_VIDEO_FPS / self.config.target_fps)
+                )
+        elif _fps_is_valid(raw_fps):
+            self._source_fps = raw_fps
             self._frame_skip_interval = max(
                 1, round(self._source_fps / self.config.target_fps)
             )
+        else:
+            self._use_wall_clock = True
 
         self._capture = capture
 
@@ -133,11 +163,13 @@ class ANPRProcessor:
         if self._frame_skip_interval is not None:
             return packet.frame_index % self._frame_skip_interval == 0
 
-        if self._last_processed_time is None:
-            return True
+        if self._use_wall_clock:
+            if self._last_processed_time is None:
+                return True
+            min_interval = 1.0 / self.config.target_fps
+            return (packet.timestamp - self._last_processed_time) >= min_interval
 
-        min_interval = 1.0 / self.config.target_fps
-        return (packet.timestamp - self._last_processed_time) >= min_interval
+        return True
 
     def _iter_image_frames(self) -> Iterator[FramePacket]:
         path = self.config.image_path
@@ -145,6 +177,7 @@ class ANPRProcessor:
         if image is None:
             raise SourceRuntimeError(f"Failed to read image source: {path}")
 
+        self._stop_reason = "image_complete"
         yield FramePacket(
             frame_index=0,
             timestamp=time.time(),
@@ -169,6 +202,7 @@ class ANPRProcessor:
                 self.config.max_seconds is not None
                 and (time.time() - start_time) >= self.config.max_seconds
             ):
+                self._stop_reason = "max_seconds_reached"
                 if pending is not None:
                     pending.is_last = True
                     yield pending
@@ -179,6 +213,12 @@ class ANPRProcessor:
                 if pending is not None:
                     pending.is_last = True
                     yield pending
+                if frame_index == 0:
+                    self._stop_reason = "zero_frames"
+                elif source_type == "video":
+                    self._stop_reason = "video_end"
+                else:
+                    self._stop_reason = "stream_read_failed"
                 break
 
             packet = FramePacket(
@@ -214,6 +254,7 @@ class ANPRProcessor:
         status: str,
     ) -> dict:
         source_path = self.config.resolved_source_path()
+        warnings = list(validation_result.warnings) + list(metrics.runtime_warnings)
         summary: dict = {
             "status": status,
             "milestone": "M2",
@@ -224,7 +265,7 @@ class ANPRProcessor:
             "events_finalized": 0,
             "backend_enabled": self.config.backend_enabled,
             "validation_mode": "strict" if strict else "standard",
-            "warnings": list(validation_result.warnings),
+            "warnings": warnings,
             "errors": [metrics.runtime_error] if metrics.runtime_error else [],
             "run_dir": str(run_dir).replace("\\", "/"),
             "target_fps": self.config.target_fps,
@@ -232,10 +273,12 @@ class ANPRProcessor:
             "frame_skip_interval": metrics.frame_skip_interval,
             "source_opened": metrics.source_opened,
             "source_completed": metrics.source_completed,
+            "stop_reason": metrics.stop_reason,
+            "max_seconds": self.config.max_seconds,
             "duration_seconds": round(metrics.duration_seconds, 3),
         }
-        if self.config.max_seconds is not None:
-            summary["max_seconds"] = self.config.max_seconds
+        if metrics.assumed_source_fps is not None:
+            summary["assumed_source_fps"] = metrics.assumed_source_fps
         return summary
 
     def _write_run_outputs(
@@ -270,6 +313,17 @@ class ANPRProcessor:
             summary=summary,
         )
 
+    def _finalize_stop_reason(self, metrics: RuntimeMetrics) -> None:
+        if metrics.frames_read == 0 and metrics.source_opened:
+            metrics.stop_reason = "zero_frames"
+            warning = "Source opened but returned zero frames"
+            if warning not in metrics.runtime_warnings:
+                metrics.runtime_warnings.append(warning)
+        elif self.config.source == "image" and metrics.frames_read > 0:
+            metrics.stop_reason = "image_complete"
+        elif self._stop_reason != "unknown":
+            metrics.stop_reason = self._stop_reason
+
     def run_dry_run(
         self,
         validation_result: ValidationResult,
@@ -283,7 +337,6 @@ class ANPRProcessor:
         """
         run_dir = self._make_run_dir()
         validation_mode = "strict" if strict else "standard"
-        source_path = self.config.resolved_source_path()
         metrics = RuntimeMetrics()
         status = "completed"
 
@@ -294,10 +347,9 @@ class ANPRProcessor:
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
                 f"Target FPS: {self.config.target_fps}",
+                f"Max seconds: {self.config.max_seconds}",
             ]
         )
-        if self.config.max_seconds is not None:
-            metrics.log_lines.append(f"Max seconds: {self.config.max_seconds}")
         if validation_result.warnings:
             metrics.log_lines.append(f"Config warnings: {len(validation_result.warnings)}")
 
@@ -307,14 +359,19 @@ class ANPRProcessor:
             if self.config.source != "image":
                 metrics.source_opened = self._capture is not None
                 metrics.source_fps = self._source_fps
+                metrics.assumed_source_fps = self._assumed_source_fps
                 metrics.frame_skip_interval = self._frame_skip_interval
                 if metrics.source_fps is not None:
                     metrics.log_lines.append(f"Source FPS: {metrics.source_fps}")
+                elif metrics.assumed_source_fps is not None:
+                    metrics.log_lines.append(
+                        f"Assumed source FPS: {metrics.assumed_source_fps}"
+                    )
                 if metrics.frame_skip_interval is not None:
                     metrics.log_lines.append(
                         f"Frame skip interval: {metrics.frame_skip_interval}"
                     )
-                else:
+                elif self._use_wall_clock:
                     metrics.log_lines.append(
                         "Frame skip interval: wall-clock fallback (source FPS unavailable)"
                     )
@@ -327,8 +384,11 @@ class ANPRProcessor:
                     self._last_processed_time = packet.timestamp
 
             metrics.source_completed = True
+            self._finalize_stop_reason(metrics)
         except SourceRuntimeError as exc:
             metrics.runtime_error = exc.message
+            metrics.stop_reason = "runtime_error"
+            metrics.source_completed = False
             status = "failed"
             metrics.log_lines.append(f"Runtime error: {exc.message}")
         finally:
@@ -340,6 +400,13 @@ class ANPRProcessor:
                 f"Frames read: {metrics.frames_read}",
                 f"Frames processed: {metrics.frames_processed}",
                 f"Source completed: {metrics.source_completed}",
+                f"Stop reason: {metrics.stop_reason}",
+            ]
+        )
+        for warning in metrics.runtime_warnings:
+            metrics.log_lines.append(f"Warning: {warning}")
+        metrics.log_lines.extend(
+            [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
                 f"M2 dry-run {status}.",
             ]

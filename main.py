@@ -7,7 +7,7 @@ import sys
 
 from anpr import ANPRProcessor
 from backend import BackendClient
-from config import Config, format_validation_output, validate_config
+from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp_source_path, validate_config
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -38,7 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--source-path",
-        help="Generic source path (RTSP URL, video file, or image file)",
+        help="Local video or image file path (not for RTSP URLs; use ANPR_RTSP_URL in .env)",
     )
     run_parser.add_argument(
         "--video",
@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "flush-backend-queue",
-        help="Flush pending backend queue items (M1 placeholder)",
+        help="Flush pending backend queue items (M2 placeholder; no network activity)",
     )
 
     return parser
@@ -100,6 +100,10 @@ def cmd_check_config(config: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_run(config: Config, args: argparse.Namespace) -> int:
+    if getattr(args, "source_path", None) and is_rtsp_source_path(args.source_path):
+        print(f"ERROR: {RTSP_URL_CLI_ERROR}")
+        return 1
+
     config.apply_cli_overrides(args)
 
     if not args.dry_run:
