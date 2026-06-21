@@ -160,6 +160,17 @@ Each valid `PlateCandidate` added to a track becomes a `PlateVote`:
 
 - Plate text is not corrected beyond M4 normalization and validation.
 
+## Post-Decision Efficiency Behavior
+
+After `decision_finalized=True`, the track remains matchable for duplicate prevention, but downstream plate detection, OCR, and vote insertion are skipped for that track until it is retired.
+
+This preserves M5 behavior:
+
+- No duplicate finalized candidate.
+- No additional votes after decision finalization.
+- Reduced plate detection and OCR calls for vehicles that already produced a decision.
+- No evidence, event, or backend side effects.
+
 ## Finalization Triggers
 
 | Trigger | Reason | Minimum votes |
@@ -203,6 +214,7 @@ Evidence is **not** written to disk in M5. No `runs/.../evidence/` folders are c
   "tracks_finalized_source_end": 0,
   "track_finalizations_rejected": 0,
   "plate_votes_added": 0,
+  "decision_finalized_tracks_skipped": 0,
   "finalized_track_candidates": [],
   "events_finalized": 0
 }

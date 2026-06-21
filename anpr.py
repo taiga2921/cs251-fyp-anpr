@@ -168,6 +168,7 @@ class RuntimeMetrics:
     tracks_finalized_source_end: int = 0
     track_finalizations_rejected: int = 0
     plate_votes_added: int = 0
+    decision_finalized_tracks_skipped: int = 0
 
 
 @dataclass
@@ -1171,6 +1172,7 @@ class ANPRProcessor:
             "tracks_finalized_source_end": metrics.tracks_finalized_source_end,
             "track_finalizations_rejected": metrics.track_finalizations_rejected,
             "plate_votes_added": metrics.plate_votes_added,
+            "decision_finalized_tracks_skipped": metrics.decision_finalized_tracks_skipped,
             "finalized_track_candidates": finalized_summary,
         }
         if metrics.assumed_source_fps is not None:
@@ -1296,6 +1298,9 @@ class ANPRProcessor:
                     matched_tracks = self.update_tracks(vehicles, packet, metrics)
                     frame_candidates: list[PlateCandidate] = []
                     for track, vehicle in matched_tracks:
+                        if track.decision_finalized:
+                            metrics.decision_finalized_tracks_skipped += 1
+                            continue
                         plates = self.detect_plates(packet.image, vehicle, metrics)
                         for plate in plates:
                             candidate = self._process_plate_detection(
@@ -1360,6 +1365,7 @@ class ANPRProcessor:
                 f"Tracks updated: {metrics.tracks_updated}",
                 f"Active tracks: {metrics.active_tracks}",
                 f"Plate votes added: {metrics.plate_votes_added}",
+                f"Decision-finalized tracks skipped: {metrics.decision_finalized_tracks_skipped}",
                 f"Tracks finalized: {metrics.tracks_finalized}",
                 f"Tracks finalized early: {metrics.tracks_finalized_early}",
                 f"Tracks finalized expired: {metrics.tracks_finalized_expired}",
