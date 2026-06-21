@@ -393,10 +393,14 @@ def _validate_inference(config: Config, result: ValidationResult) -> None:
         result.add_error(f"ANPR_VEHICLE_CONF must be between 0 and 1; got {config.vehicle_conf}.")
     if not 0.0 <= config.plate_conf <= 1.0:
         result.add_error(f"ANPR_PLATE_CONF must be between 0 and 1; got {config.plate_conf}.")
-    if not 0.0 <= config.track_iou_threshold <= 1.0:
+    if not 0.0 < config.track_iou_threshold <= 1.0:
         result.add_error(
-            f"ANPR_TRACK_IOU_THRESHOLD must be between 0 and 1; got {config.track_iou_threshold}."
+            f"ANPR_TRACK_IOU_THRESHOLD must be > 0 and <= 1; got {config.track_iou_threshold}."
         )
+    else:
+        result.add_info(f"OK: track IoU threshold configured: {config.track_iou_threshold}")
+    if config.track_expiry_seconds > 0:
+        result.add_info(f"OK: track expiry seconds configured: {config.track_expiry_seconds}")
     if config.track_expiry_seconds <= 0:
         result.add_error(
             f"ANPR_TRACK_EXPIRY_SECONDS must be > 0; got {config.track_expiry_seconds}."

@@ -1,4 +1,4 @@
-"""ANPR runtime with M4 OCR and plate normalization architecture."""
+"""ANPR runtime with M5 tracking and vote buffer architecture."""
 
 from __future__ import annotations
 
@@ -70,13 +70,58 @@ class OCRReading:
 
 @dataclass
 class PlateCandidate:
-    """Normalized and validated plate candidate (not persisted in M4)."""
+    """Normalized and validated plate candidate (not persisted as events in M5)."""
 
     raw_text: str
     normalized_text: str
     confidence: float
     plate_bbox: tuple[int, int, int, int]
     vehicle_bbox: tuple[int, int, int, int] | None = None
+
+
+@dataclass
+class PlateVote:
+    """Single OCR vote attached to a vehicle track."""
+
+    plate_text: str
+    raw_text: str
+    confidence: float
+    timestamp: float
+    frame_index: int
+    plate_bbox: tuple[int, int, int, int]
+    vehicle_bbox: tuple[int, int, int, int] | None = None
+
+
+@dataclass
+class TrackState:
+    """In-memory vehicle track with vote buffer and best evidence state."""
+
+    track_id: int
+    bbox: tuple[int, int, int, int]
+    first_seen_at: float
+    last_seen_at: float
+    first_frame_index: int
+    last_frame_index: int
+    plate_votes: list[PlateVote] = field(default_factory=list)
+    best_plate_crop: np.ndarray | None = None
+    best_full_frame: np.ndarray | None = None
+    best_annotated_frame: np.ndarray | None = None
+    best_confidence: float = 0.0
+    finalized: bool = False
+    finalization_reason: str | None = None
+
+
+@dataclass
+class FinalizedTrackCandidate:
+    """Track-level plate decision finalized in memory (not a persisted M6 event)."""
+
+    track_id: int
+    plate_number: str
+    confidence: float
+    votes: int
+    first_seen_at: float
+    last_seen_at: float
+    finalization_reason: str
 
 
 @dataclass
@@ -113,6 +158,15 @@ class RuntimeMetrics:
     plate_candidates: int = 0
     plate_candidates_rejected: int = 0
     ocr_ms_total: float = 0.0
+    tracks_created: int = 0
+    tracks_updated: int = 0
+    active_tracks: int = 0
+    tracks_finalized: int = 0
+    tracks_finalized_early: int = 0
+    tracks_finalized_expired: int = 0
+    tracks_finalized_source_end: int = 0
+    track_finalizations_rejected: int = 0
+    plate_votes_added: int = 0
 
 
 @dataclass
@@ -206,6 +260,130 @@ def validate_plate_text(normalized_text: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def calculate_iou(
+    bbox_a: tuple[int, int, int, int],
+    bbox_b: tuple[int, int, int, int],
+) -> float:
+    """Compute intersection-over-union for two axis-aligned bounding boxes."""
+    ax1, ay1, ax2, ay2 = bbox_a
+    bx1, by1, bx2, by2 = bbox_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+    inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+
+def match_detection_to_track(
+    detection: Detection,
+    tracks: dict[int, TrackState],
+    iou_threshold: float,
+) -> TrackState | None:
+    """Return the best non-finalized track matching a detection by IoU."""
+    best_track: TrackState | None = None
+    best_iou = 0.0
+    for track in tracks.values():
+        if track.finalized:
+            continue
+        iou = calculate_iou(detection.bbox, track.bbox)
+        if iou >= iou_threshold and iou > best_iou:
+            best_iou = iou
+            best_track = track
+    return best_track
+
+
+def create_track(
+    detection: Detection,
+    packet: FramePacket,
+    track_id: int,
+) -> TrackState:
+    """Create a new in-memory vehicle track."""
+    return TrackState(
+        track_id=track_id,
+        bbox=detection.bbox,
+        first_seen_at=packet.timestamp,
+        last_seen_at=packet.timestamp,
+        first_frame_index=packet.frame_index,
+        last_frame_index=packet.frame_index,
+    )
+
+
+def select_best_plate_for_track(track: TrackState) -> tuple[str, float, int] | None:
+    """
+    Select the winning plate text for a track using deterministic majority voting.
+
+    Tie-break order: vote count, average confidence, best confidence,
+    most recent vote, lexicographic plate text.
+    """
+    if not track.plate_votes:
+        return None
+
+    groups: dict[str, list[PlateVote]] = {}
+    for vote in track.plate_votes:
+        groups.setdefault(vote.plate_text, []).append(vote)
+
+    def sort_key(item: tuple[str, list[PlateVote]]) -> tuple:
+        plate_text, votes = item
+        vote_count = len(votes)
+        avg_confidence = sum(v.confidence for v in votes) / vote_count
+        best_confidence = max(v.confidence for v in votes)
+        most_recent = max(v.timestamp for v in votes)
+        return (
+            vote_count,
+            avg_confidence,
+            best_confidence,
+            most_recent,
+            plate_text,
+        )
+
+    best_plate, best_votes = max(groups.items(), key=sort_key)
+    avg_confidence = sum(v.confidence for v in best_votes) / len(best_votes)
+    return best_plate, avg_confidence, len(best_votes)
+
+
+def _annotate_evidence_frame(
+    frame: np.ndarray,
+    track_id: int,
+    plate_text: str,
+    plate_bbox: tuple[int, int, int, int],
+    vehicle_bbox: tuple[int, int, int, int] | None,
+) -> np.ndarray:
+    """Draw vehicle/plate boxes and labels on an in-memory frame copy."""
+    annotated = frame.copy()
+    if vehicle_bbox is not None:
+        vx1, vy1, vx2, vy2 = vehicle_bbox
+        cv2.rectangle(annotated, (vx1, vy1), (vx2, vy2), (0, 255, 0), 2)
+        cv2.putText(
+            annotated,
+            f"track {track_id}",
+            (vx1, max(vy1 - 8, 0)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
+    px1, py1, px2, py2 = plate_bbox
+    cv2.rectangle(annotated, (px1, py1), (px2, py2), (0, 0, 255), 2)
+    cv2.putText(
+        annotated,
+        plate_text,
+        (px1, min(py2 + 20, annotated.shape[0] - 1)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 255),
+        2,
+    )
+    return annotated
+
+
 class ANPRProcessor:
     """ANPR processor with source reading, scheduling, and YOLO detection."""
 
@@ -223,6 +401,9 @@ class ANPRProcessor:
         self._models_loaded: bool = False
         self._ocr_engine: Any = None
         self._run_candidates: list[PlateCandidate] = []
+        self._tracks: dict[int, TrackState] = {}
+        self._next_track_id: int = 1
+        self._finalized_track_candidates: list[FinalizedTrackCandidate] = []
 
     def _make_run_dir(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -417,6 +598,183 @@ class ANPRProcessor:
             plate_bbox=plate_detection.bbox,
             vehicle_bbox=vehicle_detection.bbox if vehicle_detection else None,
         )
+
+    def update_tracks(
+        self,
+        vehicle_detections: list[Detection],
+        packet: FramePacket,
+        metrics: RuntimeMetrics,
+    ) -> list[tuple[TrackState, Detection]]:
+        """Match vehicle detections to tracks via IoU and create new tracks when needed."""
+        matched: list[tuple[TrackState, Detection]] = []
+        for detection in vehicle_detections:
+            track = match_detection_to_track(
+                detection,
+                self._tracks,
+                self.config.track_iou_threshold,
+            )
+            if track is not None:
+                track.bbox = detection.bbox
+                track.last_seen_at = packet.timestamp
+                track.last_frame_index = packet.frame_index
+                metrics.tracks_updated += 1
+            else:
+                track = create_track(detection, packet, self._next_track_id)
+                self._tracks[track.track_id] = track
+                self._next_track_id += 1
+                metrics.tracks_created += 1
+            matched.append((track, detection))
+        metrics.active_tracks = sum(
+            1 for track in self._tracks.values() if not track.finalized
+        )
+        return matched
+
+    def add_plate_candidate_to_track(
+        self,
+        track: TrackState,
+        candidate: PlateCandidate,
+        frame: np.ndarray,
+        packet: FramePacket,
+        metrics: RuntimeMetrics,
+    ) -> None:
+        """Append a validated plate candidate to a track vote buffer and evidence state."""
+        vote = PlateVote(
+            plate_text=candidate.normalized_text,
+            raw_text=candidate.raw_text,
+            confidence=candidate.confidence,
+            timestamp=packet.timestamp,
+            frame_index=packet.frame_index,
+            plate_bbox=candidate.plate_bbox,
+            vehicle_bbox=candidate.vehicle_bbox,
+        )
+        track.plate_votes.append(vote)
+        metrics.plate_votes_added += 1
+
+        if candidate.confidence > track.best_confidence:
+            track.best_confidence = candidate.confidence
+            track.best_full_frame = frame.copy()
+            crop = extract_plate_crop(frame, Detection(bbox=candidate.plate_bbox, confidence=1.0))
+            track.best_plate_crop = crop.copy() if crop is not None else None
+            track.best_annotated_frame = _annotate_evidence_frame(
+                frame,
+                track.track_id,
+                candidate.normalized_text,
+                candidate.plate_bbox,
+                candidate.vehicle_bbox,
+            )
+
+    def should_finalize_track(
+        self,
+        track: TrackState,
+        packet: FramePacket,
+    ) -> tuple[bool, str | None]:
+        """Return True when early high-confidence voting criteria are met."""
+        if track.finalized or not track.plate_votes:
+            return False, None
+
+        groups: dict[str, list[PlateVote]] = {}
+        for vote in track.plate_votes:
+            groups.setdefault(vote.plate_text, []).append(vote)
+
+        for plate_text, votes in groups.items():
+            if len(votes) < self.config.early_finalize_min_votes:
+                continue
+            avg_confidence = sum(v.confidence for v in votes) / len(votes)
+            if avg_confidence >= self.config.early_finalize_min_confidence:
+                return True, "early_high_confidence"
+        return False, None
+
+    def _min_votes_for_finalize(self, reason: str) -> int:
+        if reason == "early_high_confidence":
+            return self.config.early_finalize_min_votes
+        if reason == "source_end" and self.config.source == "image":
+            return 1
+        return self.config.min_plate_votes
+
+    def finalize_track(
+        self,
+        track: TrackState,
+        reason: str,
+        metrics: RuntimeMetrics,
+    ) -> FinalizedTrackCandidate | None:
+        """Finalize a track once using vote-buffer majority selection."""
+        if track.finalized:
+            return None
+
+        selection = select_best_plate_for_track(track)
+        if selection is None:
+            track.finalized = True
+            track.finalization_reason = reason
+            metrics.track_finalizations_rejected += 1
+            return None
+
+        plate_number, confidence, vote_count = selection
+        min_votes = self._min_votes_for_finalize(reason)
+        if vote_count < min_votes:
+            if reason in {"track_expired", "source_end"}:
+                track.finalized = True
+                track.finalization_reason = reason
+                metrics.track_finalizations_rejected += 1
+            return None
+
+        track.finalized = True
+        track.finalization_reason = reason
+        metrics.tracks_finalized += 1
+        if reason == "early_high_confidence":
+            metrics.tracks_finalized_early += 1
+        elif reason == "track_expired":
+            metrics.tracks_finalized_expired += 1
+        elif reason == "source_end":
+            metrics.tracks_finalized_source_end += 1
+
+        finalized = FinalizedTrackCandidate(
+            track_id=track.track_id,
+            plate_number=plate_number,
+            confidence=round(confidence, 4),
+            votes=vote_count,
+            first_seen_at=track.first_seen_at,
+            last_seen_at=track.last_seen_at,
+            finalization_reason=reason,
+        )
+        self._finalized_track_candidates.append(finalized)
+        return finalized
+
+    def finalize_expired_tracks(
+        self,
+        packet: FramePacket,
+        metrics: RuntimeMetrics,
+    ) -> None:
+        """Finalize tracks that have not been seen within the expiry window."""
+        for track in list(self._tracks.values()):
+            if track.finalized:
+                continue
+            elapsed = packet.timestamp - track.last_seen_at
+            if elapsed < self.config.track_expiry_seconds:
+                continue
+            self.finalize_track(track, "track_expired", metrics)
+
+    def finalize_active_tracks_at_source_end(
+        self,
+        packet: FramePacket,
+        metrics: RuntimeMetrics,
+    ) -> None:
+        """Flush remaining active tracks when the source ends."""
+        for track in list(self._tracks.values()):
+            if track.finalized:
+                continue
+            self.finalize_track(track, "source_end", metrics)
+
+    def _check_early_finalization(
+        self,
+        packet: FramePacket,
+        metrics: RuntimeMetrics,
+    ) -> None:
+        for track in self._tracks.values():
+            if track.finalized:
+                continue
+            should_finalize, reason = self.should_finalize_track(track, packet)
+            if should_finalize and reason:
+                self.finalize_track(track, reason, metrics)
 
     def _parse_yolo_results(
         self,
@@ -705,9 +1063,19 @@ class ANPRProcessor:
         status: str,
     ) -> dict:
         warnings = list(validation_result.warnings) + list(metrics.runtime_warnings)
+        finalized_summary = [
+            {
+                "track_id": item.track_id,
+                "plate_number": item.plate_number,
+                "confidence": item.confidence,
+                "votes": item.votes,
+                "finalization_reason": item.finalization_reason,
+            }
+            for item in self._finalized_track_candidates
+        ]
         summary: dict = {
             "status": status,
-            "milestone": "M4",
+            "milestone": "M5",
             "source_type": self.config.source,
             "source_path": self._safe_source_path(),
             "frames_read": metrics.frames_read,
@@ -751,6 +1119,16 @@ class ANPRProcessor:
             "plate_candidates": metrics.plate_candidates,
             "plate_candidates_rejected": metrics.plate_candidates_rejected,
             "average_ocr_ms": self._average_ms(metrics.ocr_ms_total, metrics.ocr_calls),
+            "tracks_created": metrics.tracks_created,
+            "tracks_updated": metrics.tracks_updated,
+            "active_tracks": metrics.active_tracks,
+            "tracks_finalized": metrics.tracks_finalized,
+            "tracks_finalized_early": metrics.tracks_finalized_early,
+            "tracks_finalized_expired": metrics.tracks_finalized_expired,
+            "tracks_finalized_source_end": metrics.tracks_finalized_source_end,
+            "track_finalizations_rejected": metrics.track_finalizations_rejected,
+            "plate_votes_added": metrics.plate_votes_added,
+            "finalized_track_candidates": finalized_summary,
         }
         if metrics.assumed_source_fps is not None:
             summary["assumed_source_fps"] = metrics.assumed_source_fps
@@ -806,24 +1184,32 @@ class ANPRProcessor:
         strict: bool = False,
     ) -> DryRunResult:
         """
-        Open source, load models, read frames, run detection/OCR, and write outputs.
+        Open source, load models, read frames, run detection/OCR/tracking, and write outputs.
 
-        Tracking, final events, evidence, and backend calls are not performed in M4.
+        Final persisted events, evidence files, and backend calls are not performed in M5.
         """
         run_dir = self._make_run_dir()
         validation_mode = "strict" if strict else "standard"
         metrics = RuntimeMetrics()
         status = "completed"
         self._run_candidates = []
+        self._tracks = {}
+        self._next_track_id = 1
+        self._finalized_track_candidates = []
 
         metrics.log_lines.extend(
             [
-                "M4 dry-run started.",
+                "M5 dry-run started.",
                 f"Source type: {self.config.source}",
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
                 f"Target FPS: {self.config.target_fps}",
                 f"Max seconds: {self.config.max_seconds}",
+                f"Track IoU threshold: {self.config.track_iou_threshold}",
+                f"Track expiry seconds: {self.config.track_expiry_seconds}",
+                f"Early finalize min votes: {self.config.early_finalize_min_votes}",
+                f"Early finalize min confidence: {self.config.early_finalize_min_confidence}",
+                f"Min plate votes: {self.config.min_plate_votes}",
             ]
         )
         if validation_result.warnings:
@@ -855,15 +1241,18 @@ class ANPRProcessor:
             self.load_models(metrics)
             self.load_ocr_engine(metrics)
 
+            last_packet: FramePacket | None = None
             for packet in self.iter_frames():
+                last_packet = packet
                 metrics.source_opened = True
                 metrics.frames_read += 1
                 if self.should_process_frame(packet):
                     metrics.frames_processed += 1
                     self._last_processed_time = packet.timestamp
                     vehicles = self.detect_vehicles(packet.image, metrics)
+                    matched_tracks = self.update_tracks(vehicles, packet, metrics)
                     frame_candidates: list[PlateCandidate] = []
-                    for vehicle in vehicles:
+                    for track, vehicle in matched_tracks:
                         plates = self.detect_plates(packet.image, vehicle, metrics)
                         for plate in plates:
                             candidate = self._process_plate_detection(
@@ -874,7 +1263,26 @@ class ANPRProcessor:
                             )
                             if candidate is not None:
                                 frame_candidates.append(candidate)
+                                self.add_plate_candidate_to_track(
+                                    track,
+                                    candidate,
+                                    packet.image,
+                                    packet,
+                                    metrics,
+                                )
                     self._run_candidates.extend(frame_candidates)
+                    self._check_early_finalization(packet, metrics)
+                    self.finalize_expired_tracks(packet, metrics)
+
+                if packet.is_last:
+                    self.finalize_active_tracks_at_source_end(packet, metrics)
+
+            if last_packet is not None:
+                self.finalize_active_tracks_at_source_end(last_packet, metrics)
+
+            metrics.active_tracks = sum(
+                1 for track in self._tracks.values() if not track.finalized
+            )
 
             metrics.source_completed = True
             self._finalize_stop_reason(metrics)
@@ -905,6 +1313,16 @@ class ANPRProcessor:
                 f"Plate candidates: {metrics.plate_candidates}",
                 f"Plate candidates rejected: {metrics.plate_candidates_rejected}",
                 f"Average OCR ms: {self._average_ms(metrics.ocr_ms_total, metrics.ocr_calls)}",
+                f"Tracks created: {metrics.tracks_created}",
+                f"Tracks updated: {metrics.tracks_updated}",
+                f"Active tracks: {metrics.active_tracks}",
+                f"Plate votes added: {metrics.plate_votes_added}",
+                f"Tracks finalized: {metrics.tracks_finalized}",
+                f"Tracks finalized early: {metrics.tracks_finalized_early}",
+                f"Tracks finalized expired: {metrics.tracks_finalized_expired}",
+                f"Tracks finalized source end: {metrics.tracks_finalized_source_end}",
+                f"Track finalizations rejected: {metrics.track_finalizations_rejected}",
+                f"Finalized track candidates: {len(self._finalized_track_candidates)}",
                 f"Source completed: {metrics.source_completed}",
                 f"Stop reason: {metrics.stop_reason}",
             ]
@@ -914,7 +1332,7 @@ class ANPRProcessor:
         metrics.log_lines.extend(
             [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
-                f"M4 dry-run {status}.",
+                f"M5 dry-run {status}.",
             ]
         )
 
