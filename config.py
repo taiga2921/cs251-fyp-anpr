@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 VALID_SOURCES = frozenset({"rtsp", "video", "image", "webcam"})
 VALID_DEVICES = frozenset({"cpu", "cuda"})
 VALID_EVIDENCE_MODES = frozenset({"metadata", "upload"})
+VALID_OCR_ENGINES = frozenset({"paddleocr"})
 
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
@@ -175,6 +176,11 @@ class Config:
     min_plate_votes: int = 2
     min_ocr_confidence: float = 0.3
 
+    ocr_engine: str = "paddleocr"
+    ocr_lang: str = "en"
+    ocr_preprocess: bool = True
+    ocr_scale: float = 2.0
+
     backend_enabled: bool = False
     backend_base_url: str = "http://localhost:8000/api"
     backend_email: str | None = None
@@ -215,6 +221,10 @@ class Config:
             ),
             min_plate_votes=parse_int(env.get("ANPR_MIN_PLATE_VOTES"), 2),
             min_ocr_confidence=parse_float(env.get("ANPR_MIN_OCR_CONFIDENCE"), 0.3),
+            ocr_engine=parse_str(env.get("ANPR_OCR_ENGINE"), "paddleocr"),
+            ocr_lang=parse_str(env.get("ANPR_OCR_LANG"), "en"),
+            ocr_preprocess=parse_bool(env.get("ANPR_OCR_PREPROCESS"), True),
+            ocr_scale=parse_float(env.get("ANPR_OCR_SCALE"), 2.0),
             backend_enabled=parse_bool(env.get("ANPR_BACKEND_ENABLED"), False),
             backend_base_url=parse_str(env.get("ANPR_BACKEND_BASE_URL"), "http://localhost:8000/api"),
             backend_email=parse_optional_str(env.get("ANPR_BACKEND_EMAIL")),
@@ -410,6 +420,32 @@ def _validate_inference(config: Config, result: ValidationResult) -> None:
         result.add_error(f"--max-seconds must be > 0; got {config.max_seconds}.")
 
 
+def _validate_ocr(config: Config, result: ValidationResult, strict: bool) -> None:
+    if config.ocr_engine not in VALID_OCR_ENGINES:
+        result.add_error(
+            f"ANPR_OCR_ENGINE must be one of {', '.join(sorted(VALID_OCR_ENGINES))}; "
+            f"got '{config.ocr_engine}'."
+        )
+    else:
+        result.add_info(f"OK: OCR engine configured: {config.ocr_engine}")
+
+    if config.ocr_scale <= 0:
+        result.add_error(f"ANPR_OCR_SCALE must be > 0; got {config.ocr_scale}.")
+    else:
+        result.add_info(f"OK: OCR preprocess scale configured: {config.ocr_scale}")
+
+    try:
+        import paddleocr  # noqa: F401
+
+        result.add_info("OK: PaddleOCR package is available")
+    except Exception as exc:
+        message = f"PaddleOCR package is not available: {exc}"
+        if strict:
+            result.add_error(message)
+        else:
+            result.add_warning(message)
+
+
 def _validate_backend(config: Config, result: ValidationResult) -> None:
     cache_dir = Path(".cache")
     try:
@@ -472,6 +508,7 @@ def validate_config(config: Config, *, strict: bool = False) -> ValidationResult
     _validate_source(config, result)
     _validate_models(config, result, strict=strict)
     _validate_inference(config, result)
+    _validate_ocr(config, result, strict=strict)
     _validate_backend(config, result)
     _validate_output(config, result)
     return result

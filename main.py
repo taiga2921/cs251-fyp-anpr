@@ -1,4 +1,4 @@
-"""CLI entry point for AI ANPR (M3)."""
+"""CLI entry point for AI ANPR (M4)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-anpr",
-        description="AI ANPR CLI — M3 model loading and detector architecture",
+        description="AI ANPR CLI — M4 OCR and plate normalization architecture",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -29,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run ANPR processing (M3 supports --dry-run with source reading and detection)",
+        help="Run ANPR processing (M4 supports --dry-run with detection and OCR)",
     )
     run_parser.add_argument(
         "--source",
@@ -61,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Open source, load models, schedule frames, run detection, and write run output",
+        help="Open source, load models, run detection/OCR, and write run output",
     )
     run_parser.add_argument(
         "--strict",
@@ -109,7 +109,7 @@ def cmd_run(config: Config, args: argparse.Namespace) -> int:
     if not args.dry_run:
         print(
             "Non-dry-run ANPR execution is not implemented until later milestones.\n"
-            "Use --dry-run to open the source, load models, and run detection."
+            "Use --dry-run to open the source, load models, and run detection with OCR."
         )
         return 2
 
@@ -136,6 +136,9 @@ def cmd_run(config: Config, args: argparse.Namespace) -> int:
     print(f"Frames processed: {dry_run.summary.get('frames_processed', 0)}")
     print(f"Vehicle detections: {dry_run.summary.get('vehicle_detections', 0)}")
     print(f"Plate detections: {dry_run.summary.get('plate_detections', 0)}")
+    print(f"OCR calls: {dry_run.summary.get('ocr_calls', 0)}")
+    print(f"OCR readings: {dry_run.summary.get('ocr_readings', 0)}")
+    print(f"Plate candidates: {dry_run.summary.get('plate_candidates', 0)}")
     print(f"Worker log: {dry_run.worker_log}")
     print(f"Worker summary: {dry_run.worker_summary}")
     print(f"Events file: {dry_run.events_file}")

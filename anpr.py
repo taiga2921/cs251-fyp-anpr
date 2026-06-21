@@ -1,9 +1,10 @@
-"""ANPR runtime with M3 model loading and detector architecture."""
+"""ANPR runtime with M4 OCR and plate normalization architecture."""
 
 from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from config import Config, ValidationResult
 
 ASSUMED_VIDEO_FPS = 30.0
 VEHICLE_CLASS_NAMES = frozenset({"car", "motorcycle", "bus", "truck"})
+MALAYSIAN_PLATE_PATTERN = re.compile(r"^[A-Z]{1,4}[0-9]{1,4}[A-Z]?$")
 
 
 class SourceRuntimeError(Exception):
@@ -30,6 +32,10 @@ class SourceRuntimeError(Exception):
 
 class ModelLoadError(SourceRuntimeError):
     """Raised when configured models cannot be loaded."""
+
+
+class OCRLoadError(SourceRuntimeError):
+    """Raised when the OCR engine cannot be initialized."""
 
 
 @dataclass
@@ -52,6 +58,25 @@ class Detection:
     confidence: float
     class_id: int | None = None
     class_name: str | None = None
+
+
+@dataclass
+class OCRReading:
+    """Raw OCR output for a plate crop."""
+
+    raw_text: str
+    confidence: float
+
+
+@dataclass
+class PlateCandidate:
+    """Normalized and validated plate candidate (not persisted in M4)."""
+
+    raw_text: str
+    normalized_text: str
+    confidence: float
+    plate_bbox: tuple[int, int, int, int]
+    vehicle_bbox: tuple[int, int, int, int] | None = None
 
 
 @dataclass
@@ -80,6 +105,14 @@ class RuntimeMetrics:
     plate_detections: int = 0
     vehicle_detect_ms_total: float = 0.0
     plate_detect_ms_total: float = 0.0
+    plate_crops_extracted: int = 0
+    plate_crops_rejected: int = 0
+    ocr_engine_loaded: bool = False
+    ocr_calls: int = 0
+    ocr_readings: int = 0
+    plate_candidates: int = 0
+    plate_candidates_rejected: int = 0
+    ocr_ms_total: float = 0.0
 
 
 @dataclass
@@ -114,6 +147,65 @@ def _clip_bbox(
     return ix1, iy1, ix2, iy2
 
 
+def extract_plate_crop(frame: np.ndarray, plate_detection: Detection) -> np.ndarray | None:
+    """Extract a plate crop from a full frame using a plate detection bbox."""
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = plate_detection.bbox
+    bbox = _clip_bbox(x1, y1, x2, y2, width, height)
+    if bbox is None:
+        return None
+    cx1, cy1, cx2, cy2 = bbox
+    crop = frame[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return None
+    return crop
+
+
+def preprocess_plate(crop: np.ndarray, scale: float = 2.0) -> np.ndarray:
+    """Apply simple deterministic preprocessing for OCR."""
+    if len(crop.shape) == 3:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = crop.copy()
+
+    if scale > 0 and scale != 1.0:
+        gray = cv2.resize(
+            gray,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    sharpened = cv2.filter2D(gray, -1, kernel)
+    return sharpened
+
+
+def normalize_plate_text(raw_text: str) -> str:
+    """Normalize plate text to uppercase alphanumeric characters only."""
+    upper = raw_text.upper()
+    return re.sub(r"[^A-Z0-9]", "", upper)
+
+
+def validate_plate_text(normalized_text: str) -> tuple[bool, str | None]:
+    """Validate a normalized plate string against conservative Malaysian rules."""
+    if not normalized_text:
+        return False, "empty plate text"
+    if len(normalized_text) < 4:
+        return False, "plate text too short"
+    if len(normalized_text) > 10:
+        return False, "plate text too long"
+    if not re.search(r"[A-Z]", normalized_text):
+        return False, "plate text has no letters"
+    if not re.search(r"[0-9]", normalized_text):
+        return False, "plate text has no digits"
+    if not MALAYSIAN_PLATE_PATTERN.match(normalized_text):
+        return False, "plate text does not match Malaysian private-vehicle pattern"
+    return True, None
+
+
 class ANPRProcessor:
     """ANPR processor with source reading, scheduling, and YOLO detection."""
 
@@ -129,6 +221,7 @@ class ANPRProcessor:
         self._vehicle_model: Any = None
         self._plate_model: Any = None
         self._models_loaded: bool = False
+        self._ocr_engine: Any = None
 
     def _make_run_dir(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -203,6 +296,120 @@ class ANPRProcessor:
         metrics.plate_model = self.config.plate_model
         metrics.device = self.config.device
         metrics.log_lines.append(f"Device: {self.config.device}")
+
+    def load_ocr_engine(self, metrics: RuntimeMetrics) -> None:
+        """Initialize the OCR engine once per runtime."""
+        if self.config.ocr_engine != "paddleocr":
+            raise OCRLoadError(f"Unsupported OCR engine: {self.config.ocr_engine}")
+
+        metrics.log_lines.append("OCR engine loading started.")
+        try:
+            from paddleocr import PaddleOCR
+
+            self._ocr_engine = PaddleOCR(
+                use_angle_cls=False,
+                lang=self.config.ocr_lang,
+                show_log=False,
+            )
+        except ImportError as exc:
+            raise OCRLoadError(
+                "PaddleOCR is not installed. Install with: pip install paddleocr"
+            ) from exc
+        except Exception as exc:
+            raise OCRLoadError(f"Failed to initialize PaddleOCR: {exc}") from exc
+
+        metrics.ocr_engine_loaded = True
+        metrics.log_lines.append(f"OCR engine loaded: {self.config.ocr_engine}")
+
+    def read_plate_text(
+        self,
+        plate_crop: np.ndarray,
+        metrics: RuntimeMetrics,
+    ) -> OCRReading | None:
+        """Run OCR on a plate crop and return the best reading."""
+        if self._ocr_engine is None:
+            raise OCRLoadError("OCR engine is not loaded.")
+
+        metrics.ocr_calls += 1
+        start = time.perf_counter()
+
+        image = plate_crop
+        if len(plate_crop.shape) == 2:
+            image = cv2.cvtColor(plate_crop, cv2.COLOR_GRAY2BGR)
+
+        try:
+            result = self._ocr_engine.ocr(image, cls=False)
+        except Exception as exc:
+            raise SourceRuntimeError(f"OCR failed: {exc}") from exc
+        finally:
+            metrics.ocr_ms_total += (time.perf_counter() - start) * 1000.0
+
+        if not result or result[0] is None:
+            return None
+
+        fragments: list[tuple[str, float]] = []
+        for line in result[0]:
+            if not line or len(line) < 2:
+                continue
+            text_info = line[1]
+            if not text_info or len(text_info) < 2:
+                continue
+            text = str(text_info[0]).strip()
+            confidence = float(text_info[1])
+            if text:
+                fragments.append((text, confidence))
+
+        if not fragments:
+            return None
+
+        if len(fragments) == 1:
+            metrics.ocr_readings += 1
+            return OCRReading(raw_text=fragments[0][0], confidence=fragments[0][1])
+
+        fragments.sort(key=lambda item: item[1], reverse=True)
+        combined_text = "".join(text for text, _ in fragments)
+        avg_confidence = sum(conf for _, conf in fragments) / len(fragments)
+        metrics.ocr_readings += 1
+        return OCRReading(raw_text=combined_text, confidence=avg_confidence)
+
+    def _process_plate_detection(
+        self,
+        frame: np.ndarray,
+        plate_detection: Detection,
+        vehicle_detection: Detection | None,
+        metrics: RuntimeMetrics,
+    ) -> None:
+        """Extract, preprocess, OCR, normalize, and validate a plate detection."""
+        crop = extract_plate_crop(frame, plate_detection)
+        if crop is None:
+            metrics.plate_crops_rejected += 1
+            return
+
+        metrics.plate_crops_extracted += 1
+        ocr_input = (
+            preprocess_plate(crop, self.config.ocr_scale)
+            if self.config.ocr_preprocess
+            else crop
+        )
+        reading = self.read_plate_text(ocr_input, metrics)
+        if reading is None or reading.confidence < self.config.min_ocr_confidence:
+            metrics.plate_candidates_rejected += 1
+            return
+
+        normalized = normalize_plate_text(reading.raw_text)
+        valid, _reason = validate_plate_text(normalized)
+        if not valid:
+            metrics.plate_candidates_rejected += 1
+            return
+
+        metrics.plate_candidates += 1
+        PlateCandidate(
+            raw_text=reading.raw_text,
+            normalized_text=normalized,
+            confidence=reading.confidence,
+            plate_bbox=plate_detection.bbox,
+            vehicle_bbox=vehicle_detection.bbox if vehicle_detection else None,
+        )
 
     def _parse_yolo_results(
         self,
@@ -493,7 +700,7 @@ class ANPRProcessor:
         warnings = list(validation_result.warnings) + list(metrics.runtime_warnings)
         summary: dict = {
             "status": status,
-            "milestone": "M3",
+            "milestone": "M4",
             "source_type": self.config.source,
             "source_path": self._safe_source_path(),
             "frames_read": metrics.frames_read,
@@ -528,6 +735,15 @@ class ANPRProcessor:
                 metrics.plate_detect_ms_total,
                 metrics.plate_detection_calls,
             ),
+            "ocr_engine": self.config.ocr_engine,
+            "ocr_engine_loaded": metrics.ocr_engine_loaded,
+            "plate_crops_extracted": metrics.plate_crops_extracted,
+            "plate_crops_rejected": metrics.plate_crops_rejected,
+            "ocr_calls": metrics.ocr_calls,
+            "ocr_readings": metrics.ocr_readings,
+            "plate_candidates": metrics.plate_candidates,
+            "plate_candidates_rejected": metrics.plate_candidates_rejected,
+            "average_ocr_ms": self._average_ms(metrics.ocr_ms_total, metrics.ocr_calls),
         }
         if metrics.assumed_source_fps is not None:
             summary["assumed_source_fps"] = metrics.assumed_source_fps
@@ -583,9 +799,9 @@ class ANPRProcessor:
         strict: bool = False,
     ) -> DryRunResult:
         """
-        Open source, load models, read frames, run detection, and write outputs.
+        Open source, load models, read frames, run detection/OCR, and write outputs.
 
-        OCR, tracking, evidence, and backend calls are not performed in M3.
+        Tracking, final events, evidence, and backend calls are not performed in M4.
         """
         run_dir = self._make_run_dir()
         validation_mode = "strict" if strict else "standard"
@@ -594,7 +810,7 @@ class ANPRProcessor:
 
         metrics.log_lines.extend(
             [
-                "M3 dry-run started.",
+                "M4 dry-run started.",
                 f"Source type: {self.config.source}",
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
@@ -629,6 +845,7 @@ class ANPRProcessor:
                     )
 
             self.load_models(metrics)
+            self.load_ocr_engine(metrics)
 
             for packet in self.iter_frames():
                 metrics.source_opened = True
@@ -638,7 +855,14 @@ class ANPRProcessor:
                     self._last_processed_time = packet.timestamp
                     vehicles = self.detect_vehicles(packet.image, metrics)
                     for vehicle in vehicles:
-                        self.detect_plates(packet.image, vehicle, metrics)
+                        plates = self.detect_plates(packet.image, vehicle, metrics)
+                        for plate in plates:
+                            self._process_plate_detection(
+                                packet.image,
+                                plate,
+                                vehicle,
+                                metrics,
+                            )
 
             metrics.source_completed = True
             self._finalize_stop_reason(metrics)
@@ -662,6 +886,13 @@ class ANPRProcessor:
                 f"Plate detections: {metrics.plate_detections}",
                 f"Average vehicle detect ms: {self._average_ms(metrics.vehicle_detect_ms_total, metrics.vehicle_detection_calls)}",
                 f"Average plate detect ms: {self._average_ms(metrics.plate_detect_ms_total, metrics.plate_detection_calls)}",
+                f"Plate crops extracted: {metrics.plate_crops_extracted}",
+                f"Plate crops rejected: {metrics.plate_crops_rejected}",
+                f"OCR calls: {metrics.ocr_calls}",
+                f"OCR readings: {metrics.ocr_readings}",
+                f"Plate candidates: {metrics.plate_candidates}",
+                f"Plate candidates rejected: {metrics.plate_candidates_rejected}",
+                f"Average OCR ms: {self._average_ms(metrics.ocr_ms_total, metrics.ocr_calls)}",
                 f"Source completed: {metrics.source_completed}",
                 f"Stop reason: {metrics.stop_reason}",
             ]
@@ -671,7 +902,7 @@ class ANPRProcessor:
         metrics.log_lines.extend(
             [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
-                f"M3 dry-run {status}.",
+                f"M4 dry-run {status}.",
             ]
         )
 

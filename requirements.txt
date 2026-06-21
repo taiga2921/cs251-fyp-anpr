@@ -1,4 +1,5 @@
-# M3 — model loading and YOLO detection
+# M4 — OCR and plate normalization
 opencv-python
 numpy
 ultralytics
+paddleocr
