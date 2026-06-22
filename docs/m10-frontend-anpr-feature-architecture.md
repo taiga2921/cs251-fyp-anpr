@@ -94,7 +94,7 @@ src/feature/anpr-monitoring/
 | `repositories/AnprMonitoringRepository.js` | Normalize API payloads; resolve preview URLs; filter/paginate events client-side |
 | `controllers/useAnprMonitoringController.js` | List/detail state, loading, refresh, filters, pagination, navigation |
 | `views/AnprEventList.jsx` | Monitoring dashboard shell with filters, table, pagination, refresh |
-| `views/AnprEventDetail.jsx` | Event detail shell with summary, evidence, logs, raw metadata |
+| `views/AnprEventDetail.jsx` | Event detail shell with summary, evidence, and logs |
 | `components/AnprEventTable.jsx` | Presentational detection table |
 | `components/AnprEventSummaryCards.jsx` | Plate, confidence, camera, vehicle, coordinates |
 | `components/AnprEvidenceGallery.jsx` | Ordered full/plate/annotated evidence cards |
@@ -195,8 +195,9 @@ Displays:
 - Latitude/longitude when present
 - Evidence gallery (full → plate → annotated)
 - Event logs (stages such as `ai_event_created`, `ai_images_registered`, `ai_evidence_delivered`, `ai_job_succeeded`)
-- Compact raw metadata JSON panel
 - Back and Refresh actions
+
+Raw backend event payloads are not rendered on the detail page to avoid exposing sensitive relationship fields such as camera credentials.
 
 ## Evidence Display Strategy
 
@@ -275,7 +276,7 @@ M10 passes when:
 - Backend list endpoint does not support plate/validity/flagged query filters — applied client-side on the current fetch window
 - `GET /anpr-event-logs` has no `anpr_event_id` filter; log fallback fetches 100 global logs and filters in the browser
 - Image previews require backend URL resolution; local AI `runs/` paths are not directly viewable in the browser
-- Camera `password` may appear in raw API payloads (backend serialization); not displayed in the UI
+- Backend API payloads may still include sensitive camera fields until backend serialization is hardened; M10 does not render raw metadata in the UI
 
 ## M11 Handoff Notes
 

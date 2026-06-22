@@ -57,4 +57,6 @@ Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.
 
 ## Documentation
 
-Full M9 architecture: [docs/m9-evidence-delivery-architecture.md](docs/m9-evidence-delivery-architecture.md)
+Full M10 architecture: [docs/m10-frontend-anpr-feature-architecture.md](docs/m10-frontend-anpr-feature-architecture.md)
+
+M9 evidence delivery: [docs/m9-evidence-delivery-architecture.md](docs/m9-evidence-delivery-architecture.md)
