@@ -1655,7 +1655,7 @@ class ANPRProcessor:
 
         metrics.log_lines.extend(
             [
-                f"{'M6 dry-run' if dry_run else 'M9 run'} started.",
+                f"{'M9 dry-run' if dry_run else 'M9 run'} started.",
                 f"Source type: {self.config.source}",
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
@@ -1843,7 +1843,7 @@ class ANPRProcessor:
         metrics.log_lines.extend(
             [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
-                f"{'M6 dry-run' if dry_run else 'M9 run'} {status}.",
+                f"{'M9 dry-run' if dry_run else 'M9 run'} {status}.",
             ]
         )
 
