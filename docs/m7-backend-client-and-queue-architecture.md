@@ -135,9 +135,9 @@ Path: `.cache/backend_token.json`
 Path: `.cache/backend_queue.jsonl`
 
 - UTF-8, one JSON object per line
-- Atomic rewrite on flush status updates
+- Atomic rewrite on flush status updates and after `backend_event_id` checkpoint
 - Missing file treated as empty queue
-- Malformed lines are skipped, quarantined to `.cache/backend_queue.bad.jsonl`, and counted in flush output
+- Malformed lines are skipped, quarantined to `.cache/backend_queue.bad.jsonl`, and removed from the active queue on rewrite; malformed-only files are cleared after quarantine
 
 ## Queue Job Schema
 
@@ -168,6 +168,14 @@ After `POST /api/anpr-events` succeeds:
 4. Rows already `succeeded` or `skipped` are not resent.
 
 This prevents duplicate backend ANPR events when image metadata posting fails partially.
+
+### Durable `backend_event_id` checkpoint
+
+Immediately after `POST /api/anpr-events` succeeds, the queue file is atomically rewritten with `backend_event_id` set **before** any `POST /api/anpr-images` calls. If the process crashes during image metadata posting, the next flush reads the saved `backend_event_id` and skips event creation.
+
+### Malformed-only queue cleanup
+
+When the active queue contains only malformed lines, those lines are quarantined to `.cache/backend_queue.bad.jsonl` and the active queue file is cleared. Re-running `flush-backend-queue` does not re-quarantine the same bad line. Mixed valid + malformed files are rewritten to valid jobs only after flush.
 
 ## Event Payload Mapping
 

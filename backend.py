@@ -380,6 +380,10 @@ class BackendClient:
             temp_name = handle.name
         os.replace(temp_name, self.queue_file_path)
 
+    def _checkpoint_queue(self, jobs: list[BackendQueueJob]) -> None:
+        """Atomically persist the full queue (e.g. after backend_event_id is assigned)."""
+        self.write_queue(jobs)
+
     def enqueue_event(self, finalized_event: dict[str, Any]) -> BackendQueueResult:
         try:
             event_payload = self.build_event_payload(finalized_event)
@@ -497,7 +501,12 @@ class BackendClient:
                     pending.append(image_type)
         return pending
 
-    def _process_job(self, job: BackendQueueJob) -> BackendQueueJob:
+    def _process_job(
+        self,
+        job: BackendQueueJob,
+        all_jobs: list[BackendQueueJob] | None = None,
+        job_index: int | None = None,
+    ) -> BackendQueueJob:
         job = _normalize_job_image_statuses(job)
         now = _utc_now_iso()
         job.status = "posting"
@@ -507,10 +516,17 @@ class BackendClient:
             self._ensure_upload_mode_supported()
 
             backend_event_id = job.backend_event_id
+            event_created = False
             if not backend_event_id:
                 response = self._request("POST", "/anpr-events", job.event, headers={})
                 backend_event_id = self._extract_backend_event_id(response)
                 job.backend_event_id = backend_event_id
+                job.updated_at = _utc_now_iso()
+                event_created = True
+
+            if event_created and all_jobs is not None and job_index is not None:
+                all_jobs[job_index] = job
+                self._checkpoint_queue(all_jobs)
 
             if self.config.evidence_mode == "metadata":
                 self._send_pending_image_metadata(job, backend_event_id)
@@ -567,6 +583,8 @@ class BackendClient:
             )
 
         if not jobs:
+            if malformed:
+                self._checkpoint_queue([])
             message = "Backend queue is empty."
             if malformed:
                 message += f" Skipped {malformed} malformed line(s)."
@@ -583,29 +601,26 @@ class BackendClient:
         failed = 0
         exhausted = 0
         skipped = 0
-        updated_jobs: list[BackendQueueJob] = []
 
-        for job in jobs:
+        for index, job in enumerate(jobs):
             if job.status in QUEUE_STATUSES_SKIP:
                 skipped += 1
-                updated_jobs.append(job)
                 continue
 
             if job.status not in QUEUE_STATUSES_RETRYABLE:
                 skipped += 1
-                updated_jobs.append(job)
                 continue
 
             if job.attempts >= job.max_attempts:
                 job.status = "exhausted"
                 exhausted += 1
                 skipped += 1
-                updated_jobs.append(job)
+                jobs[index] = job
                 continue
 
             processed += 1
-            job = self._process_job(job)
-            updated_jobs.append(job)
+            jobs[index] = self._process_job(jobs[index], jobs, index)
+            job = jobs[index]
 
             if job.status == "succeeded":
                 succeeded += 1
@@ -616,10 +631,8 @@ class BackendClient:
             elif job.status == "failed":
                 failed += 1
 
-        self.write_queue(updated_jobs)
-        pending = sum(
-            1 for job in updated_jobs if job.status in QUEUE_STATUSES_RETRYABLE
-        )
+        self._checkpoint_queue(jobs)
+        pending = sum(1 for job in jobs if job.status in QUEUE_STATUSES_RETRYABLE)
 
         return FlushQueueResult(
             success=True,
