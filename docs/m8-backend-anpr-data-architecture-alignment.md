@@ -66,12 +66,14 @@ Response envelope: `{ success, message, data }`.
 
 ## Camera Mapping Behavior
 
-During `flush_queue()`:
+During `flush_queue()`, if at least one retryable/processable job exists:
 
 1. Authenticate if needed.
-2. Call `GET /api/cameras/{ANPR_BACKEND_CAMERA_ID}` once per flush.
+2. Call `GET /api/cameras/{ANPR_BACKEND_CAMERA_ID}` once for that flush.
 3. Confirm `data.id` matches configured camera UUID.
 4. Cache success for the remainder of the flush.
+
+If the queue is empty or contains only final/non-processable jobs, camera verification is skipped.
 
 | Result | Behavior |
 | ------ | -------- |
@@ -143,7 +145,10 @@ Older queue lines without these fields are normalized on read. M7 fields (`image
 
 ## Retry and Idempotency Behavior
 
-- **`backend_event_id` checkpoint** after successful event POST (M7 durability).
+- **`backend_event_id` checkpoint** after successful event POST.
+- **Image metadata checkpoint** after each successful image row (`image_statuses` + `images_sent` persisted immediately).
+- **Event log checkpoint** after each successful log row (`log_statuses` + `logs_sent` persisted immediately).
+- This protects retry behavior after partial flush crashes; already-succeeded images and logs are not resent.
 - **`posting` + `backend_event_id`** jobs remain retryable (crash recovery).
 - Retries skip `/api/anpr-events` when `backend_event_id` exists.
 - Image and log rows retry only when `pending` or `failed`.

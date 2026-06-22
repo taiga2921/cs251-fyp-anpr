@@ -233,6 +233,12 @@ def _is_retryable_job(job: BackendQueueJob) -> bool:
     return False
 
 
+def _has_processable_job(jobs: list[BackendQueueJob]) -> bool:
+    return any(
+        _is_retryable_job(job) and job.attempts < job.max_attempts for job in jobs
+    )
+
+
 class BackendClient:
     """Laravel API client with token cache and JSONL queue."""
 
@@ -514,6 +520,18 @@ class BackendClient:
         """Atomically persist the full queue (e.g. after backend_event_id is assigned)."""
         self.write_queue(jobs)
 
+    def _checkpoint_job_if_available(
+        self,
+        job: BackendQueueJob,
+        all_jobs: list[BackendQueueJob] | None,
+        job_index: int | None,
+    ) -> None:
+        if all_jobs is None or job_index is None:
+            return
+        job.updated_at = _utc_now_iso()
+        all_jobs[job_index] = job
+        self._checkpoint_queue(all_jobs)
+
     def enqueue_event(self, finalized_event: dict[str, Any]) -> BackendQueueResult:
         try:
             event_payload = self.build_event_payload(finalized_event)
@@ -646,6 +664,8 @@ class BackendClient:
         job: BackendQueueJob,
         backend_event_id: str,
         stage: str,
+        all_jobs: list[BackendQueueJob] | None = None,
+        job_index: int | None = None,
     ) -> None:
         status = job.log_statuses.get(stage)
         if status in STATUS_FINAL:
@@ -663,8 +683,16 @@ class BackendClient:
             )
 
         job.log_statuses[stage] = "succeeded"
+        job.logs_sent = _count_succeeded_logs(job)
+        self._checkpoint_job_if_available(job, all_jobs, job_index)
 
-    def _send_pending_image_metadata(self, job: BackendQueueJob, backend_event_id: str) -> None:
+    def _send_pending_image_metadata(
+        self,
+        job: BackendQueueJob,
+        backend_event_id: str,
+        all_jobs: list[BackendQueueJob] | None = None,
+        job_index: int | None = None,
+    ) -> None:
         for image_type in EVIDENCE_IMAGE_TYPES:
             status = job.image_statuses.get(image_type)
             if status in STATUS_FINAL:
@@ -683,6 +711,8 @@ class BackendClient:
                 )
 
             job.image_statuses[image_type] = "succeeded"
+            job.images_sent = _count_succeeded_images(job)
+            self._checkpoint_job_if_available(job, all_jobs, job_index)
 
     def _pending_image_types(self, job: BackendQueueJob) -> list[str]:
         pending: list[str] = []
@@ -753,13 +783,16 @@ class BackendClient:
                 event_created = True
 
             if event_created and all_jobs is not None and job_index is not None:
-                all_jobs[job_index] = job
-                self._checkpoint_queue(all_jobs)
+                self._checkpoint_job_if_available(job, all_jobs, job_index)
 
-            self._send_stage_log_if_pending(job, backend_event_id, "ai_event_created")
+            self._send_stage_log_if_pending(
+                job, backend_event_id, "ai_event_created", all_jobs, job_index
+            )
 
             if self.config.evidence_mode == "metadata":
-                self._send_pending_image_metadata(job, backend_event_id)
+                self._send_pending_image_metadata(
+                    job, backend_event_id, all_jobs, job_index
+                )
                 pending_images = self._pending_image_types(job)
                 if pending_images:
                     raise BackendApiError(
@@ -767,8 +800,12 @@ class BackendClient:
                         path="/anpr-images",
                     )
 
-            self._send_stage_log_if_pending(job, backend_event_id, "ai_images_registered")
-            self._send_stage_log_if_pending(job, backend_event_id, "ai_job_succeeded")
+            self._send_stage_log_if_pending(
+                job, backend_event_id, "ai_images_registered", all_jobs, job_index
+            )
+            self._send_stage_log_if_pending(
+                job, backend_event_id, "ai_job_succeeded", all_jobs, job_index
+            )
 
             pending_logs = self._pending_log_stages(job)
             if pending_logs:
@@ -823,27 +860,32 @@ class BackendClient:
             )
 
         camera_verified = False
-        try:
-            self.verify_camera_mapping()
-            camera_verified = True
-        except BackendApiError as exc:
-            if exc.is_validation_failure():
-                for index, job in enumerate(jobs):
-                    if not _is_retryable_job(job):
-                        continue
-                    jobs[index] = _normalize_job(job)
-                    jobs[index].status = "validation_failed"
-                    jobs[index].last_error = exc.message
-                    jobs[index].updated_at = _utc_now_iso()
-                self._checkpoint_queue(jobs)
+        if _has_processable_job(jobs):
+            try:
+                self.verify_camera_mapping()
+                camera_verified = True
+            except BackendApiError as exc:
+                if exc.is_validation_failure():
+                    for index, job in enumerate(jobs):
+                        if not _is_retryable_job(job):
+                            continue
+                        if job.attempts >= job.max_attempts:
+                            continue
+                        jobs[index] = _normalize_job(job)
+                        jobs[index].status = "validation_failed"
+                        jobs[index].last_error = exc.message
+                        jobs[index].updated_at = _utc_now_iso()
+                    self._checkpoint_queue(jobs)
+                    return FlushQueueResult(
+                        success=True,
+                        message="Backend camera mapping validation failed.",
+                        skipped=len(jobs),
+                        malformed=malformed,
+                        camera_verified=False,
+                    )
                 return FlushQueueResult(
-                    success=True,
-                    message="Backend camera mapping validation failed.",
-                    skipped=len(jobs),
-                    malformed=malformed,
-                    camera_verified=False,
+                    success=False, message=exc.message, malformed=malformed
                 )
-            return FlushQueueResult(success=False, message=exc.message, malformed=malformed)
 
         processed = 0
         succeeded = 0

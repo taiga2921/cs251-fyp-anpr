@@ -1,4 +1,4 @@
-"""CLI entry point for AI ANPR (M7)."""
+"""CLI entry point for AI ANPR (M8)."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run ANPR processing (M7 supports dry-run and backend-enabled runs)",
+        help="Run ANPR processing with M8 backend data alignment",
     )
     run_parser.add_argument(
         "--source",
