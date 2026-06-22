@@ -173,6 +173,8 @@ This prevents duplicate backend ANPR events when image metadata posting fails pa
 
 Immediately after `POST /api/anpr-events` succeeds, the queue file is atomically rewritten with `backend_event_id` set **before** any `POST /api/anpr-images` calls. If the process crashes during image metadata posting, the next flush reads the saved `backend_event_id` and skips event creation.
 
+A checkpointed job may be stored as status `posting` with `backend_event_id` already set if the process stops between event creation and image metadata posting. Such jobs are retryable; the next flush reuses `backend_event_id` and retries only pending/failed image metadata. A `posting` job without `backend_event_id` is skipped with a warning and left for manual inspection.
+
 ### Malformed-only queue cleanup
 
 When the active queue contains only malformed lines, those lines are quarantined to `.cache/backend_queue.bad.jsonl` and the active queue file is cleared. Re-running `flush-backend-queue` does not re-quarantine the same bad line. Mixed valid + malformed files are rewritten to valid jobs only after flush.

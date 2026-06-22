@@ -155,6 +155,14 @@ def _count_succeeded_images(job: BackendQueueJob) -> int:
     return sum(1 for status in job.image_statuses.values() if status == "succeeded")
 
 
+def _is_retryable_job(job: BackendQueueJob) -> bool:
+    if job.status in {"pending", "failed"}:
+        return True
+    if job.status == "posting" and job.backend_event_id:
+        return True
+    return False
+
+
 class BackendClient:
     """Laravel API client with token cache and JSONL queue."""
 
@@ -607,7 +615,12 @@ class BackendClient:
                 skipped += 1
                 continue
 
-            if job.status not in QUEUE_STATUSES_RETRYABLE:
+            if not _is_retryable_job(job):
+                if job.status == "posting" and not job.backend_event_id:
+                    print(
+                        f"WARNING: Skipping job {job.job_id} in posting state without "
+                        "backend_event_id; manual inspection required."
+                    )
                 skipped += 1
                 continue
 
@@ -632,7 +645,7 @@ class BackendClient:
                 failed += 1
 
         self._checkpoint_queue(jobs)
-        pending = sum(1 for job in jobs if job.status in QUEUE_STATUSES_RETRYABLE)
+        pending = sum(1 for job in jobs if _is_retryable_job(job))
 
         return FlushQueueResult(
             success=True,
