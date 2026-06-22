@@ -2,7 +2,7 @@
 
 ## Milestone Summary
 
-**M10** delivers a React-based ANPR monitoring feature that consumes Laravel ANPR APIs and presents detections, evidence metadata, and lifecycle logs to **Admin** and **Security Operator** users. The Python AI runtime (M9) continues to deliver finalized events to Laravel; M10 does not change detection, OCR, tracking, queue, or evidence delivery behavior.
+**M10** delivers a React-based ANPR monitoring feature that consumes Laravel ANPR APIs and presents detections and evidence to **Admin** and **Security Operator** users. The Python AI runtime (M9) continues to deliver finalized events to Laravel; M10 does not change detection, OCR, tracking, queue, or evidence delivery behavior.
 
 ## Objective
 
@@ -11,7 +11,6 @@ Implement an end-to-end frontend monitoring flow:
 ```text
 Laravel ANPR Event
 → Laravel ANPR Images
-→ Laravel ANPR Logs
 → React Dashboard Display
 ```
 
@@ -22,11 +21,13 @@ The feature follows the existing frontend Clean Architecture pattern under `fron
 ### In Scope
 
 - Datasource integration with Laravel ANPR REST endpoints via `src/api/api.js`
-- Repository normalization for events, images, cameras, vehicles, and logs
+- Repository normalization for events, images, cameras, and vehicles
 - Controller hooks with isolated local state (no Redux/Zustand)
 - ANPR event list and detail pages
-- Evidence gallery with safe preview URL resolution
-- Event log display with JSON/plain-text message handling
+- Evidence gallery with backend-resolved preview URLs
+- Backend-supported list filters (plate, validity, flagged)
+- Protected evidence file endpoint with allowed-root path resolution
+- Safe camera serialization in ANPR API responses
 - Role-protected routes for Admin and Security Operator
 - Sidebar navigation entry under Operator menu
 - Manual Refresh action on list and detail pages
@@ -35,8 +36,8 @@ The feature follows the existing frontend Clean Architecture pattern under `fron
 ### Out of Scope
 
 - Realtime/WebSocket ANPR updates
+- Frontend rendering of ANPR event lifecycle logs
 - Binary image upload from the frontend
-- New Laravel API endpoints (unless strictly required)
 - Changes to Python detection, OCR, tracking, queue, or evidence delivery
 - Cloud storage integration
 - Polling automation (manual refresh only in M10)
@@ -54,7 +55,7 @@ The feature follows the existing frontend Clean Architecture pattern under `fron
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
-│  AnprMonitoringRepository (normalize, filter, paginate)       │
+│  AnprMonitoringRepository (normalize, build query params)     │
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
@@ -73,7 +74,6 @@ src/feature/anpr-monitoring/
 │   ├── AnprEventTable.jsx
 │   ├── AnprEventSummaryCards.jsx
 │   ├── AnprEvidenceGallery.jsx
-│   ├── AnprEventLogs.jsx
 │   ├── AnprStatusChip.jsx
 │   └── AnprEmptyState.jsx
 ├── controllers/
@@ -90,15 +90,14 @@ src/feature/anpr-monitoring/
 
 | File | Responsibility |
 |------|----------------|
-| `datasources/anprMonitoringService.js` | HTTP calls to `/anpr-events`, `/anpr-images`, `/anpr-event-logs`; error shaping; paginator unwrap helper |
-| `repositories/AnprMonitoringRepository.js` | Normalize API payloads; resolve preview URLs; filter/paginate events client-side |
+| `datasources/anprMonitoringService.js` | HTTP calls to `/anpr-events` and `/anpr-images`; error shaping; paginator unwrap helper |
+| `repositories/AnprMonitoringRepository.js` | Normalize API payloads; build backend filter query params; resolve preview URLs |
 | `controllers/useAnprMonitoringController.js` | List/detail state, loading, refresh, filters, pagination, navigation |
 | `views/AnprEventList.jsx` | Monitoring dashboard shell with filters, table, pagination, refresh |
-| `views/AnprEventDetail.jsx` | Event detail shell with summary, evidence, and logs |
+| `views/AnprEventDetail.jsx` | Event detail shell with summary and evidence |
 | `components/AnprEventTable.jsx` | Presentational detection table |
 | `components/AnprEventSummaryCards.jsx` | Plate, confidence, camera, vehicle, coordinates |
-| `components/AnprEvidenceGallery.jsx` | Ordered full/plate/annotated evidence cards |
-| `components/AnprEventLogs.jsx` | Chronological lifecycle log list |
+| `components/AnprEvidenceGallery.jsx` | Ordered full/plate/annotated evidence cards with authenticated preview loading |
 | `components/AnprStatusChip.jsx` | Validity, flagged, and evidence status chips |
 | `components/AnprEmptyState.jsx` | Empty list placeholder |
 
@@ -106,10 +105,10 @@ src/feature/anpr-monitoring/
 
 | Endpoint | Usage |
 |----------|-------|
-| `GET /anpr-events` | Paginated event list (`page`, `per_page`) |
-| `GET /anpr-events/{id}` | Primary detail source; eager-loads `camera`, `vehicle`, `images`, `logs` |
+| `GET /anpr-events` | Paginated event list with backend filters (`page`, `per_page`, `plate_number`, `search`, `is_valid`, `is_flagged`, `date_from`, `date_to`, `camera_id`) |
+| `GET /anpr-events/{id}` | Primary detail source; eager-loads safe `camera`, `vehicle`, and `images` |
 | `GET /anpr-images?anpr_event_id={id}&per_page=100` | Fallback when detail response has no images |
-| `GET /anpr-event-logs?per_page=100` | Fallback when detail has no logs; filtered client-side by `anpr_event_id` |
+| `GET /anpr-images/{id}/file` | Protected evidence file proxy when the path resolves under configured ANPR image roots |
 
 All responses use the Laravel envelope:
 
@@ -118,6 +117,8 @@ All responses use the Laravel envelope:
 ```
 
 Paginated list endpoints return the Laravel paginator inside `data` with `data.data` as the row array.
+
+**Note:** Backend event logs remain available through `/anpr-event-logs` for audit and debugging, but M10 does not render them in the monitoring UI.
 
 ## Repository Normalization
 
@@ -130,8 +131,8 @@ The repository converts backend snake_case models into stable frontend objects.
   id, plateNumber, confidence, confidencePercent,
   detectionTime, formattedDetectionTime,
   isValid, isFlagged, latitude, longitude,
-  camera, vehicle, images, imageMap, logs,
-  evidenceCount, hasEvidence, raw
+  camera, vehicle, images, imageMap,
+  evidenceCount, hasEvidence
 }
 ```
 
@@ -140,20 +141,11 @@ The repository converts backend snake_case models into stable frontend objects.
 ```js
 {
   id, anprEventId, imageType, filePath, fileSize,
-  resolution, expiresAt, previewUrl, raw
+  resolution, expiresAt, previewUrl
 }
 ```
 
-**Log shape:**
-
-```js
-{
-  id, anprEventId, stage, message,
-  createdAt, formattedCreatedAt, raw
-}
-```
-
-Optional relationships (`camera`, `vehicle`, `images`, `logs`) are handled safely when absent.
+Optional relationships (`camera`, `vehicle`, `images`) are handled safely when absent.
 
 ## Controller State Management
 
@@ -161,15 +153,15 @@ State is isolated inside controller hooks — no global store.
 
 **List state:** `events`, `pagination`, `filters`, `loading`, `refreshing`, `error`
 
-**Filters:**
+**Filters (server-side):**
 
-- Plate number search (client-side when active; fetches up to 100 rows)
-- Valid / invalid / all (client-side)
-- Flagged / not flagged / all (client-side)
+- Plate number search → `plate_number`
+- Valid / invalid / all → `is_valid`
+- Flagged / not flagged / all → `is_flagged`
 
-When no filters are active, pagination is server-driven via `page` and `per_page`.
+Pagination is server-driven via `page` and `per_page`.
 
-**Detail controller:** loads `GET /anpr-events/{id}` first. Images and logs endpoints are called only when the detail payload does not already include them, avoiding duplicate API work.
+**Detail controller:** loads `GET /anpr-events/{id}` first. The images index endpoint is called only when the detail payload does not already include images.
 
 ## Event List Page
 
@@ -194,22 +186,22 @@ Displays:
 - Camera and vehicle panels when present
 - Latitude/longitude when present
 - Evidence gallery (full → plate → annotated)
-- Event logs (stages such as `ai_event_created`, `ai_images_registered`, `ai_evidence_delivered`, `ai_job_succeeded`)
 - Back and Refresh actions
 
 Raw backend event payloads are not rendered on the detail page to avoid exposing sensitive relationship fields such as camera credentials.
 
 ## Evidence Display Strategy
 
-The backend stores **`file_path`** as metadata — not a guaranteed browser-loadable URL. The repository resolves previews in this order:
+The backend stores **`file_path`** as metadata. When the file resolves under configured `ANPR_IMAGE_ROOTS`, Laravel exposes:
 
-1. Explicit URL fields if present: `url`, `image_url`, `public_url`, `file_url`
-2. Absolute `http://` or `https://` values in `file_path`
-3. Paths starting with `/storage/` resolved against the backend origin (derived from `VITE_API_BASE_URL`)
+- `url` and `image_url` pointing to `GET /api/anpr-images/{id}/file`
+- A protected file response that rejects path traversal and unavailable files
 
-If no usable URL exists, the gallery shows a professional **Preview unavailable** card with path, type, file size, and resolution. The UI never fabricates URLs pointing at local `runs/` filesystem paths.
+The frontend evidence gallery:
 
-**M10 depends on the backend exposing or resolving evidence paths for actual image previews.**
+1. Uses `url` / `image_url` from normalized image payloads
+2. Fetches protected file URLs with the JWT `Authorization` header and renders a blob preview
+3. Shows a professional **Preview unavailable** card with metadata when no resolvable URL exists or loading fails
 
 ## Routing and Permissions
 
@@ -246,14 +238,17 @@ Security Operator menu filtering in `getMenuItemsForRole.js` includes `operator-
 1. Login as Admin
 2. Open `/admin/anpr-monitoring`
 3. Confirm ANPR events load
-4. Open an event detail page
-5. Confirm evidence metadata appears
-6. Confirm preview images appear only when a valid browser-loadable URL exists
-7. Confirm event logs appear when available
-8. Confirm Security Operator can access the feature
-9. Confirm Guard cannot access the feature
-10. Confirm direct refresh of routes works with Vite/React Router
-11. Run `yarn lint` and `yarn build` in `frontend-react-v1`
+4. Test plate, validity, and flagged filters
+5. Open an event detail page
+6. Confirm evidence metadata appears
+7. Confirm evidence previews load when Laravel can resolve files
+8. Confirm missing evidence files show safe placeholders
+9. Confirm no event logs or raw metadata are displayed
+10. Confirm camera credentials are not visible in network responses
+11. Confirm Security Operator can access the feature
+12. Confirm Guard cannot access the feature
+13. Run `yarn lint` and `yarn build` in `frontend-react-v1`
+14. Run `php artisan test` in `backend-laravel-v1`
 
 ## Passing Criteria
 
@@ -261,30 +256,25 @@ M10 passes when:
 
 - `src/feature/anpr-monitoring/` exists and follows the feature pattern
 - Datasource calls Laravel APIs through `api.js`
-- Repository normalizes events, images, and logs
+- Repository normalizes events and images
 - Controller isolates loading, error, pagination, and detail state
-- List and detail pages display detections, evidence, and logs
+- List and detail pages display detections and evidence
 - Routes are protected for Admin and Security Operator
 - Sidebar exposes ANPR Monitoring
 - README updated minimally
 - This document exists and is complete
 - `yarn lint` and `yarn build` pass (or failures are documented)
+- Backend filters, safe camera serialization, and evidence file proxy are implemented
 
 ## Known Limitations
 
 - No realtime ANPR feed; manual refresh only
-- Backend list endpoint does not support plate/validity/flagged query filters — applied client-side on the current fetch window
-- `GET /anpr-event-logs` has no `anpr_event_id` filter; log fallback fetches 100 global logs and filters in the browser
-- Image previews require backend URL resolution; local AI `runs/` paths are not directly viewable in the browser
-- Backend API payloads may still include sensitive camera fields until backend serialization is hardened; M10 does not render raw metadata in the UI
 
 ## M11 Handoff Notes
 
 Potential follow-ups for M11:
 
-- Backend filtering for plate number, validity, flagged status, and date range
-- Dedicated `anpr_event_id` filter on event logs index
-- Signed or public evidence URL generation in Laravel for reliable previews
 - Optional polling or WebSocket push for new detections
+- Date-range filters in the frontend UI (`date_from`, `date_to` already supported by backend)
 - Binary evidence upload endpoint if upload mode is activated
-- Hide sensitive camera credentials at the API layer
+- Optional operator-facing lifecycle log viewer separate from the main monitoring UI
