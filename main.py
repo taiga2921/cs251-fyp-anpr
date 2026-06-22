@@ -1,4 +1,4 @@
-"""CLI entry point for AI ANPR (M5)."""
+"""CLI entry point for AI ANPR (M6)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-anpr",
-        description="AI ANPR CLI — M5 tracking and vote buffer architecture",
+        description="AI ANPR CLI — M6 final event and evidence architecture",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -29,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run ANPR processing (M5 supports --dry-run with detection, OCR, and tracking)",
+        help="Run ANPR processing (M6 supports --dry-run with events and evidence)",
     )
     run_parser.add_argument(
         "--source",
@@ -109,7 +109,7 @@ def cmd_run(config: Config, args: argparse.Namespace) -> int:
     if not args.dry_run:
         print(
             "Non-dry-run ANPR execution is not implemented until later milestones.\n"
-            "Use --dry-run to open the source, load models, and run detection with OCR and tracking."
+            "Use --dry-run to open the source, load models, and run local event/evidence output."
         )
         return 2
 
@@ -144,6 +144,10 @@ def cmd_run(config: Config, args: argparse.Namespace) -> int:
     print(f"Tracks finalized: {dry_run.summary.get('tracks_finalized', 0)}")
     finalized = dry_run.summary.get("finalized_track_candidates", [])
     print(f"Finalized track candidates: {len(finalized)}")
+    print(f"Events finalized: {dry_run.summary.get('events_finalized', 0)}")
+    print(f"Events written: {dry_run.summary.get('events_written', 0)}")
+    print(f"Evidence files saved: {dry_run.summary.get('evidence_files_saved', 0)}")
+    print(f"Duplicate events suppressed: {dry_run.summary.get('duplicate_events_suppressed', 0)}")
     print(f"Worker log: {dry_run.worker_log}")
     print(f"Worker summary: {dry_run.worker_summary}")
     print(f"Events file: {dry_run.events_file}")

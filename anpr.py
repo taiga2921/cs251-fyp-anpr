@@ -1,4 +1,4 @@
-"""ANPR runtime with M5 tracking and vote buffer architecture."""
+"""ANPR runtime with M6 final event and evidence architecture."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import math
 import re
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, fields
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -114,7 +114,7 @@ class TrackState:
 
 @dataclass
 class FinalizedTrackCandidate:
-    """Track-level plate decision finalized in memory (not a persisted M6 event)."""
+    """Track-level plate decision finalized in memory."""
 
     track_id: int
     plate_number: str
@@ -123,6 +123,31 @@ class FinalizedTrackCandidate:
     first_seen_at: float
     last_seen_at: float
     finalization_reason: str
+
+
+@dataclass
+class FinalizedEvent:
+    """Persisted local ANPR event record (M6)."""
+
+    event_id: str
+    run_id: str
+    track_id: int
+    plate_number: str
+    confidence: float
+    votes: int
+    first_seen_at: float
+    last_seen_at: float
+    first_frame_index: int | None
+    last_frame_index: int | None
+    finalization_reason: str
+    source_type: str
+    source_path: str | None
+    vehicle_bbox: tuple[int, int, int, int] | None
+    plate_bbox: tuple[int, int, int, int] | None
+    evidence: dict[str, str | None]
+    backend: dict[str, object]
+    dry_run: bool
+    created_at: str
 
 
 @dataclass
@@ -169,6 +194,11 @@ class RuntimeMetrics:
     track_finalizations_rejected: int = 0
     plate_votes_added: int = 0
     decision_finalized_tracks_skipped: int = 0
+    events_finalized: int = 0
+    events_written: int = 0
+    evidence_files_saved: int = 0
+    evidence_save_failures: int = 0
+    duplicate_events_suppressed: int = 0
 
 
 @dataclass
@@ -363,8 +393,9 @@ def _annotate_evidence_frame(
     plate_text: str,
     plate_bbox: tuple[int, int, int, int],
     vehicle_bbox: tuple[int, int, int, int] | None,
+    confidence: float | None = None,
 ) -> np.ndarray:
-    """Draw vehicle/plate boxes and labels on an in-memory frame copy."""
+    """Draw vehicle/plate boxes, track id, plate text, and confidence on a frame copy."""
     annotated = frame.copy()
     if vehicle_bbox is not None:
         vx1, vy1, vx2, vy2 = vehicle_bbox
@@ -380,9 +411,12 @@ def _annotate_evidence_frame(
         )
     px1, py1, px2, py2 = plate_bbox
     cv2.rectangle(annotated, (px1, py1), (px2, py2), (0, 0, 255), 2)
+    label = plate_text
+    if confidence is not None:
+        label = f"{plate_text} {confidence:.2f}"
     cv2.putText(
         annotated,
-        plate_text,
+        label,
         (px1, min(py2 + 20, annotated.shape[0] - 1)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
@@ -390,6 +424,34 @@ def _annotate_evidence_frame(
         2,
     )
     return annotated
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _default_backend_state() -> dict[str, object]:
+    return {
+        "queued": False,
+        "posted": False,
+        "event_id": None,
+        "images_sent": 0,
+        "error": None,
+    }
+
+
+def finalized_event_to_dict(event: FinalizedEvent) -> dict[str, object]:
+    """Convert a FinalizedEvent to a JSON-serializable dict."""
+    payload: dict[str, object] = {}
+    for item in fields(event):
+        value = getattr(event, item.name)
+        if isinstance(value, tuple):
+            payload[item.name] = list(value)
+        elif isinstance(value, Path):
+            payload[item.name] = str(value).replace("\\", "/")
+        else:
+            payload[item.name] = value
+    return payload
 
 
 class ANPRProcessor:
@@ -412,6 +474,12 @@ class ANPRProcessor:
         self._tracks: dict[int, TrackState] = {}
         self._next_track_id: int = 1
         self._finalized_track_candidates: list[FinalizedTrackCandidate] = []
+        self._finalized_events: list[FinalizedEvent] = []
+        self._run_dir: Path | None = None
+        self._run_id: str = ""
+        self._events_file: Path | None = None
+        self._evidence_dirs: dict[str, Path] = {}
+        self._plate_last_event_at: dict[str, float] = {}
 
     def _make_run_dir(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -680,6 +748,7 @@ class ANPRProcessor:
                 candidate.normalized_text,
                 candidate.plate_bbox,
                 candidate.vehicle_bbox,
+                candidate.confidence,
             )
 
     def should_finalize_track(
@@ -760,7 +829,161 @@ class ANPRProcessor:
             finalization_reason=reason,
         )
         self._finalized_track_candidates.append(finalized)
+        self._persist_finalized_event(track, finalized, metrics)
         return finalized
+
+    def _event_bboxes(
+        self,
+        track: TrackState,
+        plate_number: str,
+    ) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
+        """Resolve vehicle and plate bboxes for an event from track votes."""
+        matching = [vote for vote in track.plate_votes if vote.plate_text == plate_number]
+        if matching:
+            best_vote = max(matching, key=lambda vote: vote.confidence)
+            vehicle_bbox = best_vote.vehicle_bbox or track.bbox
+            return vehicle_bbox, best_vote.plate_bbox
+        return track.bbox, None
+
+    def _ensure_evidence_dirs(self, run_dir: Path) -> None:
+        """Create evidence subdirectories under a run folder."""
+        evidence_root = run_dir / "evidence"
+        self._evidence_dirs = {
+            "full": evidence_root / "full",
+            "plate": evidence_root / "plate",
+            "annotated": evidence_root / "annotated",
+        }
+        for directory in self._evidence_dirs.values():
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def _relative_run_path(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    def _save_evidence_images(
+        self,
+        track: TrackState,
+        event_id: str,
+        candidate: FinalizedTrackCandidate,
+        metrics: RuntimeMetrics,
+    ) -> dict[str, str | None]:
+        """Save best evidence images for a finalized event."""
+        evidence: dict[str, str | None] = {
+            "full": None,
+            "plate": None,
+            "annotated": None,
+        }
+        if not self.config.save_local_evidence:
+            return evidence
+        if not self._evidence_dirs:
+            return evidence
+
+        vehicle_bbox, plate_bbox = self._event_bboxes(track, candidate.plate_number)
+        annotated_image = track.best_annotated_frame
+        if track.best_full_frame is not None and plate_bbox is not None:
+            annotated_image = _annotate_evidence_frame(
+                track.best_full_frame,
+                track.track_id,
+                candidate.plate_number,
+                plate_bbox,
+                vehicle_bbox,
+                candidate.confidence,
+            )
+
+        image_sets = {
+            "full": (track.best_full_frame, self._evidence_dirs["full"] / f"{event_id}_full.jpg"),
+            "plate": (
+                track.best_plate_crop,
+                self._evidence_dirs["plate"] / f"{event_id}_plate.jpg",
+            ),
+            "annotated": (
+                annotated_image,
+                self._evidence_dirs["annotated"] / f"{event_id}_annotated.jpg",
+            ),
+        }
+        for key, (image, path) in image_sets.items():
+            if image is None or image.size == 0:
+                metrics.evidence_save_failures += 1
+                warning = f"Evidence {key} image missing for {event_id}"
+                if warning not in metrics.runtime_warnings:
+                    metrics.runtime_warnings.append(warning)
+                metrics.log_lines.append(f"Warning: {warning}")
+                continue
+            if cv2.imwrite(str(path), image):
+                evidence[key] = self._relative_run_path(path)
+                metrics.evidence_files_saved += 1
+            else:
+                metrics.evidence_save_failures += 1
+                warning = f"Failed to write evidence {key} image for {event_id}"
+                if warning not in metrics.runtime_warnings:
+                    metrics.runtime_warnings.append(warning)
+                metrics.log_lines.append(f"Warning: {warning}")
+        return evidence
+
+    def write_event_record(self, events_file: Path, event: FinalizedEvent) -> None:
+        """Append one JSON object as a single UTF-8 line to events.jsonl."""
+        line = json.dumps(finalized_event_to_dict(event), separators=(",", ":"))
+        with events_file.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+    def _persist_finalized_event(
+        self,
+        track: TrackState,
+        candidate: FinalizedTrackCandidate,
+        metrics: RuntimeMetrics,
+    ) -> None:
+        """Convert a finalized track candidate into a persisted event and evidence."""
+        if self._run_dir is None or self._events_file is None:
+            return
+
+        plate_number = candidate.plate_number
+        cooldown = self.config.duplicate_cooldown_seconds
+        if cooldown > 0 and plate_number in self._plate_last_event_at:
+            elapsed = candidate.last_seen_at - self._plate_last_event_at[plate_number]
+            if elapsed < cooldown:
+                metrics.duplicate_events_suppressed += 1
+                metrics.log_lines.append(
+                    f"Duplicate event suppressed for plate {plate_number} "
+                    f"(cooldown {cooldown}s, elapsed {elapsed:.3f}s)"
+                )
+                return
+
+        event_id = f"local-{self._run_id}-track_{candidate.track_id}"
+        vehicle_bbox, plate_bbox = self._event_bboxes(track, plate_number)
+        evidence = self._save_evidence_images(track, event_id, candidate, metrics)
+
+        event = FinalizedEvent(
+            event_id=event_id,
+            run_id=self._run_id,
+            track_id=candidate.track_id,
+            plate_number=plate_number,
+            confidence=candidate.confidence,
+            votes=candidate.votes,
+            first_seen_at=candidate.first_seen_at,
+            last_seen_at=candidate.last_seen_at,
+            first_frame_index=track.first_frame_index,
+            last_frame_index=track.last_frame_index,
+            finalization_reason=candidate.finalization_reason,
+            source_type=self.config.source,
+            source_path=self._safe_source_path(),
+            vehicle_bbox=vehicle_bbox,
+            plate_bbox=plate_bbox,
+            evidence=evidence,
+            backend=_default_backend_state(),
+            dry_run=True,
+            created_at=_utc_now_iso(),
+        )
+        self.write_event_record(self._events_file, event)
+        self._finalized_events.append(event)
+        metrics.events_finalized += 1
+        metrics.events_written += 1
+        self._plate_last_event_at[plate_number] = candidate.last_seen_at
+        metrics.log_lines.append(
+            f"Event persisted: {event_id} plate={plate_number} "
+            f"reason={candidate.finalization_reason}"
+        )
 
     def _retire_track(self, track: TrackState, reason: str) -> None:
         """Retire a track from matching without creating a duplicate candidate."""
@@ -1117,14 +1340,30 @@ class ANPRProcessor:
             }
             for item in self._finalized_track_candidates
         ]
+        events_summary = [
+            {
+                "event_id": item.event_id,
+                "track_id": item.track_id,
+                "plate_number": item.plate_number,
+                "confidence": item.confidence,
+                "votes": item.votes,
+                "finalization_reason": item.finalization_reason,
+            }
+            for item in self._finalized_events
+        ]
         summary: dict = {
             "status": status,
-            "milestone": "M5",
+            "milestone": "M6",
             "source_type": self.config.source,
             "source_path": self._safe_source_path(),
             "frames_read": metrics.frames_read,
             "frames_processed": metrics.frames_processed,
-            "events_finalized": 0,
+            "events_finalized": metrics.events_finalized,
+            "events_written": metrics.events_written,
+            "evidence_files_saved": metrics.evidence_files_saved,
+            "evidence_save_failures": metrics.evidence_save_failures,
+            "duplicate_events_suppressed": metrics.duplicate_events_suppressed,
+            "finalized_events": events_summary,
             "backend_enabled": self.config.backend_enabled,
             "validation_mode": "strict" if strict else "standard",
             "warnings": warnings,
@@ -1201,7 +1440,8 @@ class ANPRProcessor:
             json.dumps(summary, indent=2) + "\n",
             encoding="utf-8",
         )
-        events_file.write_text("", encoding="utf-8")
+        if not events_file.exists():
+            events_file.write_text("", encoding="utf-8")
 
         return DryRunResult(
             run_dir=run_dir,
@@ -1231,9 +1471,14 @@ class ANPRProcessor:
         """
         Open source, load models, read frames, run detection/OCR/tracking, and write outputs.
 
-        Final persisted events, evidence files, and backend calls are not performed in M5.
+        M6 dry-run persists local events and evidence; backend calls are not performed.
         """
         run_dir = self._make_run_dir()
+        self._run_dir = run_dir
+        self._run_id = run_dir.name
+        self._events_file = run_dir / "events.jsonl"
+        self._events_file.write_text("", encoding="utf-8")
+        self._ensure_evidence_dirs(run_dir)
         validation_mode = "strict" if strict else "standard"
         metrics = RuntimeMetrics()
         status = "completed"
@@ -1241,10 +1486,12 @@ class ANPRProcessor:
         self._tracks = {}
         self._next_track_id = 1
         self._finalized_track_candidates = []
+        self._finalized_events = []
+        self._plate_last_event_at = {}
 
         metrics.log_lines.extend(
             [
-                "M5 dry-run started.",
+                "M6 dry-run started.",
                 f"Source type: {self.config.source}",
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
@@ -1255,6 +1502,8 @@ class ANPRProcessor:
                 f"Early finalize min votes: {self.config.early_finalize_min_votes}",
                 f"Early finalize min confidence: {self.config.early_finalize_min_confidence}",
                 f"Min plate votes: {self.config.min_plate_votes}",
+                f"Duplicate cooldown seconds: {self.config.duplicate_cooldown_seconds}",
+                f"Save local evidence: {self.config.save_local_evidence}",
             ]
         )
         if validation_result.warnings:
@@ -1372,6 +1621,11 @@ class ANPRProcessor:
                 f"Tracks finalized source end: {metrics.tracks_finalized_source_end}",
                 f"Track finalizations rejected: {metrics.track_finalizations_rejected}",
                 f"Finalized track candidates: {len(self._finalized_track_candidates)}",
+                f"Events finalized: {metrics.events_finalized}",
+                f"Events written: {metrics.events_written}",
+                f"Evidence files saved: {metrics.evidence_files_saved}",
+                f"Evidence save failures: {metrics.evidence_save_failures}",
+                f"Duplicate events suppressed: {metrics.duplicate_events_suppressed}",
                 f"Source completed: {metrics.source_completed}",
                 f"Stop reason: {metrics.stop_reason}",
             ]
@@ -1381,7 +1635,7 @@ class ANPRProcessor:
         metrics.log_lines.extend(
             [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
-                f"M5 dry-run {status}.",
+                f"M6 dry-run {status}.",
             ]
         )
 

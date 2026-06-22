@@ -176,6 +176,7 @@ class Config:
     early_finalize_min_confidence: float = 0.90
     min_plate_votes: int = 2
     min_ocr_confidence: float = 0.3
+    duplicate_cooldown_seconds: float = 10.0
 
     ocr_engine: str = "paddleocr"
     ocr_lang: str = "en"
@@ -222,6 +223,9 @@ class Config:
             ),
             min_plate_votes=parse_int(env.get("ANPR_MIN_PLATE_VOTES"), 2),
             min_ocr_confidence=parse_float(env.get("ANPR_MIN_OCR_CONFIDENCE"), 0.3),
+            duplicate_cooldown_seconds=parse_float(
+                env.get("ANPR_DUPLICATE_COOLDOWN_SECONDS"), 10.0
+            ),
             ocr_engine=parse_str(env.get("ANPR_OCR_ENGINE"), "paddleocr"),
             ocr_lang=parse_str(env.get("ANPR_OCR_LANG"), "en"),
             ocr_preprocess=parse_bool(env.get("ANPR_OCR_PREPROCESS"), True),
@@ -419,6 +423,15 @@ def _validate_inference(config: Config, result: ValidationResult) -> None:
     if not 0.0 <= config.min_ocr_confidence <= 1.0:
         result.add_error(
             f"ANPR_MIN_OCR_CONFIDENCE must be between 0 and 1; got {config.min_ocr_confidence}."
+        )
+    if config.duplicate_cooldown_seconds < 0:
+        result.add_error(
+            "ANPR_DUPLICATE_COOLDOWN_SECONDS must be >= 0; "
+            f"got {config.duplicate_cooldown_seconds}."
+        )
+    else:
+        result.add_info(
+            f"OK: duplicate cooldown seconds configured: {config.duplicate_cooldown_seconds}"
         )
 
     if config.max_seconds is not None and config.max_seconds <= 0:
