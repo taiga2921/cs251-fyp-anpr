@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from config import Config, ValidationResult
-from backend import BackendClient
+from backend import BackendClient, FlushQueueResult
 
 ASSUMED_VIDEO_FPS = 30.0
 VEHICLE_CLASS_NAMES = frozenset({"car", "motorcycle", "bus", "truck"})
@@ -955,6 +955,30 @@ class ANPRProcessor:
         with events_file.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
+    def _write_backend_results(self, run_dir: Path, flush_result: FlushQueueResult) -> None:
+        """Write post-flush backend job status for events finalized in this run."""
+        if self._backend_client is None:
+            return
+
+        local_event_ids = {event.event_id for event in self._finalized_events}
+        results = self._backend_client.job_results_for_local_events(local_event_ids)
+        if not results:
+            return
+
+        payload = {
+            "flush": {
+                "processed": flush_result.processed,
+                "succeeded": flush_result.succeeded,
+                "failed": flush_result.failed,
+                "exhausted": flush_result.exhausted,
+                "pending": flush_result.pending,
+                "malformed": flush_result.malformed,
+            },
+            "events": results,
+        }
+        output_path = run_dir / "backend_results.json"
+        output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
     def _persist_finalized_event(
         self,
         track: TrackState,
@@ -1686,8 +1710,11 @@ class ANPRProcessor:
                     f"succeeded={flush_result.succeeded} "
                     f"failed={flush_result.failed} "
                     f"exhausted={flush_result.exhausted} "
-                    f"pending={flush_result.pending}"
+                    f"pending={flush_result.pending} "
+                    f"malformed={flush_result.malformed}"
                 )
+                self._write_backend_results(run_dir, flush_result)
+                metrics.log_lines.append(f"Backend results written: {run_dir / 'backend_results.json'}")
         except SourceRuntimeError as exc:
             metrics.runtime_error = exc.message
             metrics.stop_reason = "runtime_error"

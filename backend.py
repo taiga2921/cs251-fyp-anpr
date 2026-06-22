@@ -12,12 +12,14 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
-from config import Config
+from config import Config, UPLOAD_MODE_ERROR
 
 TOKEN_EXPIRY_BUFFER_SECONDS = 60
 QUEUE_STATUSES_RETRYABLE = frozenset({"pending", "failed"})
 QUEUE_STATUSES_SKIP = frozenset({"succeeded", "exhausted", "validation_failed"})
 EVIDENCE_IMAGE_TYPES = ("full", "plate", "annotated")
+IMAGE_STATUSES_FINAL = frozenset({"succeeded", "skipped", "validation_failed"})
+IMAGE_STATUSES_RETRYABLE = frozenset({"pending", "failed"})
 
 
 @dataclass
@@ -33,6 +35,7 @@ class BackendQueueJob:
     local_event_id: str
     status: str
     attempts: int
+    retry_limit: int
     max_attempts: int
     backend_event_id: str | None
     images_sent: int
@@ -41,6 +44,7 @@ class BackendQueueJob:
     updated_at: str
     event: dict[str, Any]
     evidence: dict[str, str | None]
+    image_statuses: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,6 +52,7 @@ class BackendQueueJob:
             "local_event_id": self.local_event_id,
             "status": self.status,
             "attempts": self.attempts,
+            "retry_limit": self.retry_limit,
             "max_attempts": self.max_attempts,
             "backend_event_id": self.backend_event_id,
             "images_sent": self.images_sent,
@@ -56,24 +61,45 @@ class BackendQueueJob:
             "updated_at": self.updated_at,
             "event": self.event,
             "evidence": self.evidence,
+            "image_statuses": self.image_statuses,
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> BackendQueueJob:
-        return cls(
+        evidence = dict(payload.get("evidence", {}))
+        retry_limit = payload.get("retry_limit")
+        max_attempts = payload.get("max_attempts")
+        if retry_limit is not None:
+            retry_limit = int(retry_limit)
+            max_attempts = (
+                int(max_attempts) if max_attempts is not None else retry_limit + 1
+            )
+        elif max_attempts is not None:
+            max_attempts = int(max_attempts)
+            retry_limit = max(0, max_attempts - 1)
+        else:
+            retry_limit = 3
+            max_attempts = 4
+
+        image_statuses = dict(payload.get("image_statuses", {}))
+
+        job = cls(
             job_id=str(payload["job_id"]),
             local_event_id=str(payload["local_event_id"]),
             status=str(payload.get("status", "pending")),
             attempts=int(payload.get("attempts", 0)),
-            max_attempts=int(payload.get("max_attempts", 0)),
+            retry_limit=retry_limit,
+            max_attempts=max_attempts,
             backend_event_id=payload.get("backend_event_id"),
             images_sent=int(payload.get("images_sent", 0)),
             last_error=payload.get("last_error"),
             created_at=str(payload.get("created_at", _utc_now_iso())),
             updated_at=str(payload.get("updated_at", _utc_now_iso())),
             event=dict(payload.get("event", {})),
-            evidence=dict(payload.get("evidence", {})),
+            evidence=evidence,
+            image_statuses=image_statuses,
         )
+        return _normalize_job_image_statuses(job)
 
 
 @dataclass
@@ -93,6 +119,7 @@ class FlushQueueResult:
     exhausted: int = 0
     skipped: int = 0
     pending: int = 0
+    malformed: int = 0
 
 
 def _utc_now_iso() -> str:
@@ -116,6 +143,18 @@ def _detection_time_from_event(event: dict[str, Any]) -> str:
     return created_at
 
 
+def _normalize_job_image_statuses(job: BackendQueueJob) -> BackendQueueJob:
+    if not job.image_statuses:
+        for key in EVIDENCE_IMAGE_TYPES:
+            if job.evidence.get(key):
+                job.image_statuses[key] = "pending"
+    return job
+
+
+def _count_succeeded_images(job: BackendQueueJob) -> int:
+    return sum(1 for status in job.image_statuses.values() if status == "succeeded")
+
+
 class BackendClient:
     """Laravel API client with token cache and JSONL queue."""
 
@@ -123,6 +162,7 @@ class BackendClient:
         self.config = config
         self.token_cache_path = Path(config.backend_token_cache)
         self.queue_file_path = Path(config.backend_queue_file)
+        self.bad_queue_path = self.queue_file_path.parent / "backend_queue.bad.jsonl"
         self.base_url = config.backend_base_url.rstrip("/")
 
     def _ensure_parent_dirs(self, path: Path) -> None:
@@ -288,15 +328,39 @@ class BackendClient:
             "longitude": None,
         }
 
-    def read_queue(self) -> list[BackendQueueJob]:
+    def read_queue(self) -> tuple[list[BackendQueueJob], int]:
         if not self.queue_file_path.is_file():
-            return []
+            return [], 0
         jobs: list[BackendQueueJob] = []
-        for line in self.queue_file_path.read_text(encoding="utf-8").splitlines():
+        malformed = 0
+        for line_number, line in enumerate(
+            self.queue_file_path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
             if not line.strip():
                 continue
-            jobs.append(BackendQueueJob.from_dict(json.loads(line)))
-        return jobs
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                malformed += 1
+                self._quarantine_bad_line(line_number, line, str(exc))
+                continue
+            if not isinstance(payload, dict):
+                malformed += 1
+                self._quarantine_bad_line(line_number, line, "Queue line is not a JSON object.")
+                continue
+            try:
+                jobs.append(BackendQueueJob.from_dict(payload))
+            except (KeyError, TypeError, ValueError) as exc:
+                malformed += 1
+                self._quarantine_bad_line(line_number, line, str(exc))
+        return jobs, malformed
+
+    def _quarantine_bad_line(self, line_number: int, raw: str, error: str) -> None:
+        record = {"line_number": line_number, "raw": raw, "error": error}
+        self._ensure_parent_dirs(self.bad_queue_path)
+        with self.bad_queue_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def write_queue(self, jobs: list[BackendQueueJob]) -> None:
         self._ensure_parent_dirs(self.queue_file_path)
@@ -323,12 +387,14 @@ class BackendClient:
             return BackendQueueResult(success=False, message=str(exc))
 
         now = _utc_now_iso()
+        retry_limit = self.config.backend_retry_limit
         job = BackendQueueJob(
             job_id=str(uuid.uuid4()),
             local_event_id=str(finalized_event.get("event_id", "")),
             status="pending",
             attempts=0,
-            max_attempts=self.config.backend_retry_limit,
+            retry_limit=retry_limit,
+            max_attempts=retry_limit + 1,
             backend_event_id=None,
             images_sent=0,
             last_error=None,
@@ -340,7 +406,8 @@ class BackendClient:
                 for key in EVIDENCE_IMAGE_TYPES
             },
         )
-        jobs = self.read_queue()
+        _normalize_job_image_statuses(job)
+        jobs, _ = self.read_queue()
         jobs.append(job)
         self.write_queue(jobs)
         return BackendQueueResult(
@@ -394,28 +461,66 @@ class BackendClient:
         }
         self._request("POST", "/anpr-images", payload, headers={})
 
+    def _ensure_upload_mode_supported(self) -> None:
+        if self.config.backend_enabled and self.config.evidence_mode == "upload":
+            raise RuntimeError(UPLOAD_MODE_ERROR)
+
+    def _send_pending_image_metadata(self, job: BackendQueueJob, backend_event_id: str) -> None:
+        for image_type in EVIDENCE_IMAGE_TYPES:
+            status = job.image_statuses.get(image_type)
+            if status in IMAGE_STATUSES_FINAL:
+                continue
+
+            file_path = job.evidence.get(image_type)
+            if not file_path:
+                job.image_statuses[image_type] = "skipped"
+                continue
+
+            try:
+                self._post_image_metadata(job, backend_event_id, image_type, file_path)
+            except RuntimeError as exc:
+                message = str(exc)
+                if "HTTP 422" in message or "Validation failed" in message:
+                    job.image_statuses[image_type] = "validation_failed"
+                    raise RuntimeError(message) from exc
+                job.image_statuses[image_type] = "failed"
+                raise
+
+            job.image_statuses[image_type] = "succeeded"
+
+    def _pending_image_types(self, job: BackendQueueJob) -> list[str]:
+        pending: list[str] = []
+        for image_type in EVIDENCE_IMAGE_TYPES:
+            status = job.image_statuses.get(image_type)
+            if status in IMAGE_STATUSES_RETRYABLE or status is None:
+                if job.evidence.get(image_type):
+                    pending.append(image_type)
+        return pending
+
     def _process_job(self, job: BackendQueueJob) -> BackendQueueJob:
+        job = _normalize_job_image_statuses(job)
         now = _utc_now_iso()
         job.status = "posting"
         job.updated_at = now
 
         try:
-            response = self._request("POST", "/anpr-events", job.event, headers={})
-            backend_event_id = self._extract_backend_event_id(response)
-            job.backend_event_id = backend_event_id
-            images_sent = 0
+            self._ensure_upload_mode_supported()
+
+            backend_event_id = job.backend_event_id
+            if not backend_event_id:
+                response = self._request("POST", "/anpr-events", job.event, headers={})
+                backend_event_id = self._extract_backend_event_id(response)
+                job.backend_event_id = backend_event_id
 
             if self.config.evidence_mode == "metadata":
-                for image_type in EVIDENCE_IMAGE_TYPES:
-                    file_path = job.evidence.get(image_type)
-                    if not file_path:
-                        continue
-                    self._post_image_metadata(job, backend_event_id, image_type, file_path)
-                    images_sent += 1
-            elif self.config.evidence_mode == "upload":
-                raise RuntimeError("ANPR_EVIDENCE_MODE=upload is not supported in M7.")
+                self._send_pending_image_metadata(job, backend_event_id)
+                pending_images = self._pending_image_types(job)
+                if pending_images:
+                    raise RuntimeError(
+                        "Image metadata incomplete for: " + ", ".join(pending_images)
+                    )
 
-            job.images_sent = images_sent
+            job.images_sent = _count_succeeded_images(job)
             job.status = "succeeded"
             job.last_error = None
             job.updated_at = _utc_now_iso()
@@ -424,13 +529,18 @@ class BackendClient:
             message = str(exc)
             job.last_error = message
             job.updated_at = _utc_now_iso()
+            job.images_sent = _count_succeeded_images(job)
+
+            if message == UPLOAD_MODE_ERROR:
+                job.status = "validation_failed"
+                return job
 
             if "HTTP 422" in message or "Validation failed" in message:
                 job.status = "validation_failed"
                 return job
 
             job.attempts += 1
-            if job.max_attempts >= 0 and job.attempts >= job.max_attempts:
+            if job.attempts >= job.max_attempts:
                 job.status = "exhausted"
             else:
                 job.status = "failed"
@@ -444,13 +554,28 @@ class BackendClient:
                 processed=0,
             )
 
-        jobs = self.read_queue()
+        try:
+            self._ensure_upload_mode_supported()
+        except RuntimeError as exc:
+            return FlushQueueResult(success=False, message=str(exc))
+
+        jobs, malformed = self.read_queue()
+        if malformed:
+            print(
+                f"WARNING: Skipped {malformed} malformed queue line(s); "
+                f"quarantined to {self.bad_queue_path}"
+            )
+
         if not jobs:
+            message = "Backend queue is empty."
+            if malformed:
+                message += f" Skipped {malformed} malformed line(s)."
             return FlushQueueResult(
                 success=True,
-                message="Backend queue is empty.",
+                message=message,
                 processed=0,
                 pending=0,
+                malformed=malformed,
             )
 
         processed = 0
@@ -471,7 +596,7 @@ class BackendClient:
                 updated_jobs.append(job)
                 continue
 
-            if job.max_attempts >= 0 and job.attempts >= job.max_attempts:
+            if job.attempts >= job.max_attempts:
                 job.status = "exhausted"
                 exhausted += 1
                 skipped += 1
@@ -505,4 +630,24 @@ class BackendClient:
             exhausted=exhausted,
             skipped=skipped,
             pending=pending,
+            malformed=malformed,
         )
+
+    def job_results_for_local_events(
+        self, local_event_ids: set[str]
+    ) -> dict[str, dict[str, Any]]:
+        if not local_event_ids:
+            return {}
+        jobs, _ = self.read_queue()
+        results: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            if job.local_event_id not in local_event_ids:
+                continue
+            results[job.local_event_id] = {
+                "job_id": job.job_id,
+                "status": job.status,
+                "backend_event_id": job.backend_event_id,
+                "images_sent": job.images_sent,
+                "last_error": job.last_error,
+            }
+        return results

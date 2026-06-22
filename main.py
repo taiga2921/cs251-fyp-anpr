@@ -7,7 +7,7 @@ import sys
 
 from anpr import ANPRProcessor
 from backend import BackendClient
-from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp_source_path, validate_config
+from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp_source_path, validate_backend_config, validate_config
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -174,9 +174,9 @@ def cmd_flush_backend_queue(config: Config) -> int:
         print("Backend disabled (ANPR_BACKEND_ENABLED=false). No jobs to flush.")
         return 0
 
-    result = validate_config(config, strict=True)
+    result = validate_backend_config(config)
     if not result.ok:
-        print("Configuration validation failed before queue flush:")
+        print("Backend configuration validation failed before queue flush:")
         print(format_validation_output(result))
         return 1
 
@@ -189,6 +189,7 @@ def cmd_flush_backend_queue(config: Config) -> int:
     print(f"Exhausted: {flush_result.exhausted}")
     print(f"Skipped: {flush_result.skipped}")
     print(f"Pending: {flush_result.pending}")
+    print(f"Malformed: {flush_result.malformed}")
     return 0 if flush_result.success else 1
 
 

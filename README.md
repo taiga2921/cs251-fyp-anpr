@@ -57,7 +57,7 @@ python main.py flush-backend-queue
 
 ## Output
 
-Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.json`, `events.jsonl`, and `evidence/`. Backend queue state is stored in `.cache/backend_queue.jsonl`.
+Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.json`, `events.jsonl`, `evidence/`, and (after backend flush) `backend_results.json`. Backend queue state is stored in `.cache/backend_queue.jsonl`. `ANPR_BACKEND_RETRY_LIMIT` is the number of retries after the first attempt (0 = one try only).
 
 ## Documentation
 

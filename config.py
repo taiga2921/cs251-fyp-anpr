@@ -15,6 +15,11 @@ VALID_DEVICES = frozenset({"cpu", "cuda"})
 VALID_EVIDENCE_MODES = frozenset({"metadata", "upload"})
 VALID_OCR_ENGINES = frozenset({"paddleocr"})
 
+UPLOAD_MODE_ERROR = (
+    "ANPR_EVIDENCE_MODE=upload is not supported in M7 because no backend upload endpoint exists. "
+    "Use ANPR_EVIDENCE_MODE=metadata."
+)
+
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
@@ -501,7 +506,10 @@ def _validate_backend(config: Config, result: ValidationResult) -> None:
             f"ANPR_BACKEND_RETRY_LIMIT must be >= 0; got {config.backend_retry_limit}."
         )
     else:
-        result.add_info(f"OK: backend retry limit configured: {config.backend_retry_limit}")
+        result.add_info(
+            f"OK: backend retry limit configured: {config.backend_retry_limit} "
+            f"(max {config.backend_retry_limit + 1} attempt(s) per job)"
+        )
 
     if config.backend_timeout_seconds <= 0:
         result.add_error(
@@ -513,18 +521,36 @@ def _validate_backend(config: Config, result: ValidationResult) -> None:
         )
 
 
-def _validate_output(config: Config, result: ValidationResult) -> None:
+def _validate_evidence_mode(config: Config, result: ValidationResult) -> None:
     if config.evidence_mode not in VALID_EVIDENCE_MODES:
         result.add_error(
             f"ANPR_EVIDENCE_MODE must be one of {', '.join(sorted(VALID_EVIDENCE_MODES))}; "
             f"got '{config.evidence_mode}'."
         )
-    else:
-        result.add_info(f"OK: evidence mode configured: {config.evidence_mode}")
-        if config.evidence_mode == "upload":
-            result.add_warning(
-                "ANPR_EVIDENCE_MODE=upload is not supported in M7; use metadata mode."
-            )
+        return
+
+    result.add_info(f"OK: evidence mode configured: {config.evidence_mode}")
+    if config.evidence_mode == "upload" and config.backend_enabled:
+        result.add_error(UPLOAD_MODE_ERROR)
+
+
+def validate_backend_config(config: Config) -> ValidationResult:
+    """Validate only backend queue/posting settings (no models, OCR, or source checks)."""
+    result = ValidationResult()
+    cache_dir = Path(".cache")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        result.add_info("OK: .cache directory ready")
+    except OSError as exc:
+        result.add_error(f"Cannot create .cache directory: {exc}")
+
+    if not config.backend_enabled:
+        result.add_info("OK: backend disabled; credentials not required")
+        return result
+
+    _validate_backend(config, result)
+    _validate_evidence_mode(config, result)
+    return result
 
 
 def validate_config(config: Config, *, strict: bool = False) -> ValidationResult:
@@ -543,7 +569,7 @@ def validate_config(config: Config, *, strict: bool = False) -> ValidationResult
     _validate_inference(config, result)
     _validate_ocr(config, result, strict=strict)
     _validate_backend(config, result)
-    _validate_output(config, result)
+    _validate_evidence_mode(config, result)
     return result
 
 

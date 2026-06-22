@@ -49,12 +49,13 @@ Finalize ANPR events locally (M6), enqueue backend jobs safely, reuse cached tok
 ### `config.py`
 
 - `ANPR_BACKEND_TIMEOUT_SECONDS` validation
-- Upload mode warning
+- `validate_backend_config()` for queue-flush-only validation
+- Upload mode rejected when backend enabled
 
 ### `main.py`
 
 - Non-dry-run `run` when backend enabled
-- Real `flush-backend-queue` implementation
+- `flush-backend-queue` uses backend-only validation (no model/OCR/source checks)
 
 ## Architecture Flow
 
@@ -76,9 +77,15 @@ _persist_finalized_event()
 (end of image/video run)
         |
         v
-flush_queue() → login if needed → POST /anpr-events
+flush_queue() → login if needed
         |
-        +--> POST /anpr-images (metadata mode)
+        +--> if backend_event_id exists: skip POST /anpr-events
+        |    else: POST /anpr-events, store backend_event_id
+        |
+        +--> POST /anpr-images for pending image_statuses only (metadata mode)
+        |
+        v
+backend_results.json (finite image/video runs after auto-flush)
 ```
 
 ## Backend Configuration Contract
@@ -91,9 +98,21 @@ flush_queue() → login if needed → POST /anpr-events
 | `ANPR_BACKEND_CAMERA_ID` | UUID camera FK for events |
 | `ANPR_BACKEND_TOKEN_CACHE` | JWT cache path |
 | `ANPR_BACKEND_QUEUE_FILE` | Queue JSONL path |
-| `ANPR_BACKEND_RETRY_LIMIT` | Max retry attempts per job |
+| `ANPR_BACKEND_RETRY_LIMIT` | Retries after the first attempt (`max_attempts = retry_limit + 1`) |
 | `ANPR_BACKEND_TIMEOUT_SECONDS` | HTTP timeout |
-| `ANPR_EVIDENCE_MODE` | `metadata` supported; `upload` unsupported |
+| `ANPR_EVIDENCE_MODE` | `metadata` supported; `upload` rejected when backend enabled |
+
+`flush-backend-queue` validates only backend settings via `validate_backend_config()` — not YOLO models, OCR, or source media.
+
+## Upload Mode Rejection
+
+When `ANPR_BACKEND_ENABLED=true` and `ANPR_EVIDENCE_MODE=upload`:
+
+- `check-config --strict` fails with an explicit error
+- Non-dry-run `run` fails before processing
+- `flush-backend-queue` fails before any HTTP POST
+
+No `/api/anpr-events` or `/api/anpr-images` calls are made in upload mode.
 
 ## Token Cache Contract
 
@@ -118,6 +137,7 @@ Path: `.cache/backend_queue.jsonl`
 - UTF-8, one JSON object per line
 - Atomic rewrite on flush status updates
 - Missing file treated as empty queue
+- Malformed lines are skipped, quarantined to `.cache/backend_queue.bad.jsonl`, and counted in flush output
 
 ## Queue Job Schema
 
@@ -126,13 +146,28 @@ Path: `.cache/backend_queue.jsonl`
 | `job_id` | UUID |
 | `local_event_id` | Local event ID from M6 |
 | `status` | `pending`, `posting`, `succeeded`, `failed`, `exhausted`, `validation_failed` |
-| `attempts` | Posting attempts |
-| `max_attempts` | From `ANPR_BACKEND_RETRY_LIMIT` |
+| `attempts` | Failed posting attempts so far |
+| `retry_limit` | From `ANPR_BACKEND_RETRY_LIMIT` |
+| `max_attempts` | `retry_limit + 1` (total attempts allowed) |
 | `event` | Backend POST payload |
 | `evidence` | Relative evidence paths |
-| `backend_event_id` | Laravel UUID after success |
-| `images_sent` | Metadata rows created |
+| `image_statuses` | Per-image metadata state (`pending`, `succeeded`, `failed`, `skipped`, `validation_failed`) |
+| `backend_event_id` | Laravel UUID after event creation (reused on retry) |
+| `images_sent` | Count of successfully posted image metadata rows |
 | `last_error` | Last failure message |
+
+Older queue lines without `image_statuses` or `retry_limit` are normalized on read: available evidence keys become `pending`; `max_attempts` is derived from legacy fields when needed.
+
+## Idempotent Retry Behavior
+
+After `POST /api/anpr-events` succeeds:
+
+1. `backend_event_id` is stored on the queue job immediately.
+2. On retry, event creation is **skipped** if `backend_event_id` is already set.
+3. Only image metadata rows with `image_statuses` of `pending` or `failed` are retried.
+4. Rows already `succeeded` or `skipped` are not resent.
+
+This prevents duplicate backend ANPR events when image metadata posting fails partially.
 
 ## Event Payload Mapping
 
@@ -166,15 +201,39 @@ Posts to `POST /api/anpr-images` with `file_path`, `file_size`, `resolution`, `e
 | `--dry-run` | Yes | No | No |
 | `run` (no flag) | Yes | Yes (if enabled) | Via flush after finite sources or `flush-backend-queue` |
 
+### `events.jsonl` vs post-flush status
+
+The `backend` object in `events.jsonl` records **enqueue-time** state (`queued`, `posted: false`, etc.) at the moment the line is written.
+
+After finite-source auto-flush, final backend status is written to:
+
+```text
+runs/run_YYYYMMDD_HHMMSS/backend_results.json
+```
+
+Use `backend_results.json` or `.cache/backend_queue.jsonl` to inspect final job status, `backend_event_id`, and `images_sent`.
+
 ## Retry and Failure Handling
+
+`ANPR_BACKEND_RETRY_LIMIT` is the number of **retries after the first attempt**:
+
+| Value | Total attempts |
+| ----- | -------------- |
+| `0` | 1 (try once, no retry) |
+| `1` | 2 (try once, retry once) |
+| `3` | 4 (try once, up to 3 more retries) |
+
+Internally: `max_attempts = retry_limit + 1`. A job is `exhausted` when `attempts >= max_attempts`.
 
 | Condition | Behavior |
 | --------- | -------- |
 | Valid token cache | Reuse |
 | Expired/missing token | Login |
 | HTTP 401 | Refresh token, retry once |
-| HTTP 422 | `validation_failed`, no endless retry |
+| HTTP 422 (event or image) | `validation_failed`, no endless retry |
 | HTTP 5xx / network | `failed`, retry until limit |
+| Partial image metadata failure | Reuse `backend_event_id`; retry only pending/failed images |
+| Malformed queue line | Skip line, quarantine, continue flush |
 | Limit reached | `exhausted` |
 | Empty queue | Success, processed `0` |
 
@@ -198,7 +257,8 @@ M6 event/evidence metrics are preserved.
 
 - Backend enabled/disabled, queue path, dry-run flag at startup
 - Enqueue success/failure by local event ID
-- Flush summary counts
+- Flush summary counts including `malformed`
+- Malformed queue lines logged with quarantine path
 - No passwords, tokens, or Authorization headers
 
 ## CLI Behavior
@@ -216,8 +276,11 @@ Non-dry-run requires `ANPR_BACKEND_ENABLED=true`.
 - Token cache and queue implemented
 - Dry-run has no backend side effects
 - Non-dry-run enqueues without blocking frame loop
-- `flush-backend-queue` posts pending jobs
-- Retry limit honored
+- `flush-backend-queue` posts pending jobs (backend-only validation)
+- Idempotent retry reuses `backend_event_id` and per-image `image_statuses`
+- Upload mode rejected before posting when backend enabled
+- Malformed queue lines quarantined without crashing flush
+- Retry limit semantics: `max_attempts = retry_limit + 1`
 - Secrets never logged
 - M4/M5/M6 behavior intact
 
@@ -240,9 +303,10 @@ python main.py flush-backend-queue
 
 ## Known Limitations
 
-- `ANPR_EVIDENCE_MODE=upload` is not implemented (no upload endpoint in backend)
+- `ANPR_EVIDENCE_MODE=upload` is rejected in config/flush; no upload endpoint in backend
 - RTSP/live runs do not auto-flush; use `flush-backend-queue`
 - Metadata mode stores paths only; backend must resolve files locally
+- `events.jsonl` `backend` block is enqueue-time only; see `backend_results.json` after auto-flush
 - Duplicate cooldown is local-runtime only (M6); queue does not deduplicate across runs
 - Requires valid `camera_id` UUID existing in Laravel `cameras` table
 
