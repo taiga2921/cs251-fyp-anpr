@@ -16,8 +16,8 @@ VALID_EVIDENCE_MODES = frozenset({"metadata", "upload"})
 VALID_OCR_ENGINES = frozenset({"paddleocr"})
 
 UPLOAD_MODE_ERROR = (
-    "ANPR_EVIDENCE_MODE=upload is not supported in M7 because no backend upload endpoint exists. "
-    "Use ANPR_EVIDENCE_MODE=metadata."
+    "ANPR_EVIDENCE_MODE=upload is designed for M9 but unsupported until the Laravel backend "
+    "exposes a multipart image upload endpoint. Use ANPR_EVIDENCE_MODE=metadata."
 )
 
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")
@@ -202,6 +202,7 @@ class Config:
     runs_dir: str = "runs"
     save_local_evidence: bool = True
     delete_local_after_upload: bool = False
+    evidence_retention_days: int = 0
 
     max_seconds: float | None = None
 
@@ -249,7 +250,11 @@ class Config:
             runs_dir=parse_path(env.get("ANPR_RUNS_DIR"), "runs"),
             save_local_evidence=parse_bool(env.get("ANPR_SAVE_LOCAL_EVIDENCE"), True),
             delete_local_after_upload=parse_bool(env.get("ANPR_DELETE_LOCAL_AFTER_UPLOAD"), False),
+            evidence_retention_days=parse_int(env.get("ANPR_EVIDENCE_RETENTION_DAYS"), 0),
         )
+
+    def project_root_path(self) -> Path:
+        return Path.cwd().resolve()
 
     def runs_dir_path(self) -> Path:
         return Path(self.runs_dir)
@@ -530,8 +535,49 @@ def _validate_evidence_mode(config: Config, result: ValidationResult) -> None:
         return
 
     result.add_info(f"OK: evidence mode configured: {config.evidence_mode}")
+
     if config.evidence_mode == "upload" and config.backend_enabled:
         result.add_error(UPLOAD_MODE_ERROR)
+
+    if config.evidence_mode == "metadata":
+        project_root = config.project_root_path()
+        result.add_info(
+            f"OK: metadata mode stores evidence paths relative to project root ({project_root})"
+        )
+        if config.backend_enabled:
+            result.add_warning(
+                "Metadata mode requires Laravel to resolve local evidence paths. Configure "
+                "Laravel ANPR_IMAGE_ROOTS (or equivalent) to include the AI ANPR project root, "
+                f"for example: ANPR_IMAGE_ROOTS={project_root}"
+            )
+
+    if config.delete_local_after_upload:
+        if config.evidence_mode == "upload":
+            result.add_warning(
+                "ANPR_DELETE_LOCAL_AFTER_UPLOAD is set but upload mode is unsupported in M9; "
+                "local evidence will not be deleted."
+            )
+        elif config.evidence_mode == "metadata":
+            result.add_warning(
+                "ANPR_DELETE_LOCAL_AFTER_UPLOAD is ignored in metadata mode because the backend "
+                "may still depend on local evidence paths."
+            )
+
+
+def _validate_evidence_retention(config: Config, result: ValidationResult) -> None:
+    if config.evidence_retention_days < 0:
+        result.add_error(
+            f"ANPR_EVIDENCE_RETENTION_DAYS must be >= 0; got {config.evidence_retention_days}."
+        )
+        return
+
+    if config.evidence_retention_days == 0:
+        result.add_info("OK: local evidence retention: keep indefinitely (0 days)")
+    else:
+        result.add_info(
+            f"OK: local evidence retention: delete evidence in runs older than "
+            f"{config.evidence_retention_days} day(s) (never the current run)"
+        )
 
 
 def validate_backend_config(config: Config) -> ValidationResult:
@@ -550,6 +596,7 @@ def validate_backend_config(config: Config) -> ValidationResult:
 
     _validate_backend(config, result)
     _validate_evidence_mode(config, result)
+    _validate_evidence_retention(config, result)
     return result
 
 
@@ -570,6 +617,7 @@ def validate_config(config: Config, *, strict: bool = False) -> ValidationResult
     _validate_ocr(config, result, strict=strict)
     _validate_backend(config, result)
     _validate_evidence_mode(config, result)
+    _validate_evidence_retention(config, result)
     return result
 
 

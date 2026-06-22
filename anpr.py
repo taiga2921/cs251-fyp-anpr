@@ -1,4 +1,4 @@
-"""ANPR runtime with M8 backend data alignment."""
+"""ANPR runtime with M9 evidence delivery architecture."""
 
 from __future__ import annotations
 
@@ -206,6 +206,8 @@ class RuntimeMetrics:
     backend_jobs_exhausted: int = 0
     backend_logs_sent: int = 0
     backend_camera_verified: bool = False
+    backend_images_sent: int = 0
+    local_evidence_deleted: int = 0
 
 
 @dataclass
@@ -887,9 +889,53 @@ class ANPRProcessor:
 
     def _relative_run_path(self, path: Path) -> str:
         try:
-            return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+            return path.resolve().relative_to(self.config.project_root_path()).as_posix()
         except ValueError:
-            return path.as_posix()
+            return path.resolve().as_posix()
+
+    def _cleanup_expired_evidence(self, current_run_dir: Path, metrics: RuntimeMetrics) -> None:
+        """Delete evidence files in old runs past retention; never touch the current run."""
+        retention_days = self.config.evidence_retention_days
+        if retention_days <= 0:
+            return
+
+        runs_root = self.config.runs_dir_path().resolve()
+        current_resolved = current_run_dir.resolve()
+        cutoff = time.time() - (retention_days * 86400)
+
+        for run_dir in runs_root.glob("run_*"):
+            if not run_dir.is_dir():
+                continue
+            try:
+                if run_dir.resolve() == current_resolved:
+                    continue
+            except OSError:
+                continue
+
+            evidence_dir = run_dir / "evidence"
+            if not evidence_dir.is_dir():
+                continue
+
+            try:
+                if evidence_dir.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+
+            for file_path in evidence_dir.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                try:
+                    file_path.resolve().relative_to(runs_root)
+                except ValueError:
+                    continue
+                try:
+                    file_path.unlink()
+                    metrics.local_evidence_deleted += 1
+                except OSError:
+                    metrics.log_lines.append(
+                        f"Warning: failed to delete expired evidence file {file_path}"
+                    )
 
     def _save_evidence_images(
         self,
@@ -977,6 +1023,7 @@ class ANPRProcessor:
                 "malformed": flush_result.malformed,
                 "camera_verified": flush_result.camera_verified,
                 "logs_sent": flush_result.logs_sent,
+                "images_sent": flush_result.images_sent,
             },
             "events": results,
         }
@@ -1436,9 +1483,11 @@ class ANPRProcessor:
         ]
         summary: dict = {
             "status": status,
-            "milestone": "M8",
+            "milestone": "M9",
             "source_type": self.config.source,
             "source_path": self._safe_source_path(),
+            "evidence_mode": self.config.evidence_mode,
+            "evidence_retention_days": self.config.evidence_retention_days,
             "frames_read": metrics.frames_read,
             "frames_processed": metrics.frames_processed,
             "events_finalized": metrics.events_finalized,
@@ -1453,7 +1502,9 @@ class ANPRProcessor:
             "backend_jobs_failed": metrics.backend_jobs_failed,
             "backend_jobs_exhausted": metrics.backend_jobs_exhausted,
             "backend_logs_sent": metrics.backend_logs_sent,
+            "backend_images_sent": metrics.backend_images_sent,
             "backend_camera_verified": metrics.backend_camera_verified,
+            "local_evidence_deleted": metrics.local_evidence_deleted,
             "backend_queue_file": self.config.backend_queue_file,
             "validation_mode": "strict" if strict else "standard",
             "warnings": warnings,
@@ -1604,7 +1655,7 @@ class ANPRProcessor:
 
         metrics.log_lines.extend(
             [
-                f"{'M6 dry-run' if dry_run else 'M8 run'} started.",
+                f"{'M6 dry-run' if dry_run else 'M9 run'} started.",
                 f"Source type: {self.config.source}",
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
@@ -1619,6 +1670,8 @@ class ANPRProcessor:
                 f"Early finalize min confidence: {self.config.early_finalize_min_confidence}",
                 f"Min plate votes: {self.config.min_plate_votes}",
                 f"Duplicate cooldown seconds: {self.config.duplicate_cooldown_seconds}",
+                f"Evidence mode: {self.config.evidence_mode}",
+                f"Evidence retention days: {self.config.evidence_retention_days}",
                 f"Save local evidence: {self.config.save_local_evidence}",
             ]
         )
@@ -1711,6 +1764,7 @@ class ANPRProcessor:
                 metrics.backend_jobs_failed += flush_result.failed
                 metrics.backend_jobs_exhausted += flush_result.exhausted
                 metrics.backend_logs_sent += flush_result.logs_sent
+                metrics.backend_images_sent += flush_result.images_sent
                 metrics.backend_camera_verified = flush_result.camera_verified
                 metrics.log_lines.append(
                     "Backend queue flush: "
@@ -1720,11 +1774,15 @@ class ANPRProcessor:
                     f"exhausted={flush_result.exhausted} "
                     f"pending={flush_result.pending} "
                     f"malformed={flush_result.malformed} "
+                    f"images_sent={flush_result.images_sent} "
                     f"logs_sent={flush_result.logs_sent} "
                     f"camera_verified={flush_result.camera_verified}"
                 )
                 self._write_backend_results(run_dir, flush_result)
                 metrics.log_lines.append(f"Backend results written: {run_dir / 'backend_results.json'}")
+
+            if not dry_run:
+                self._cleanup_expired_evidence(run_dir, metrics)
         except SourceRuntimeError as exc:
             metrics.runtime_error = exc.message
             metrics.stop_reason = "runtime_error"
@@ -1772,7 +1830,9 @@ class ANPRProcessor:
                 f"Backend jobs succeeded: {metrics.backend_jobs_succeeded}",
                 f"Backend jobs failed: {metrics.backend_jobs_failed}",
                 f"Backend jobs exhausted: {metrics.backend_jobs_exhausted}",
+                f"Backend images sent: {metrics.backend_images_sent}",
                 f"Backend logs sent: {metrics.backend_logs_sent}",
+                f"Local evidence deleted: {metrics.local_evidence_deleted}",
                 f"Backend camera verified: {metrics.backend_camera_verified}",
                 f"Source completed: {metrics.source_completed}",
                 f"Stop reason: {metrics.stop_reason}",
@@ -1783,7 +1843,7 @@ class ANPRProcessor:
         metrics.log_lines.extend(
             [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
-                f"{'M6 dry-run' if dry_run else 'M8 run'} {status}.",
+                f"{'M6 dry-run' if dry_run else 'M9 run'} {status}.",
             ]
         )
 

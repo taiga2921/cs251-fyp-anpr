@@ -1,4 +1,4 @@
-"""Backend client, token cache, and queue for M8."""
+"""Backend client, token cache, and queue for M9."""
 
 from __future__ import annotations
 
@@ -17,7 +17,12 @@ from config import Config, UPLOAD_MODE_ERROR
 TOKEN_EXPIRY_BUFFER_SECONDS = 60
 QUEUE_STATUSES_SKIP = frozenset({"succeeded", "exhausted", "validation_failed"})
 EVIDENCE_IMAGE_TYPES = ("full", "plate", "annotated")
-EVENT_LOG_STAGES = ("ai_event_created", "ai_images_registered", "ai_job_succeeded")
+EVENT_LOG_STAGES = (
+    "ai_event_created",
+    "ai_images_registered",
+    "ai_evidence_delivered",
+    "ai_job_succeeded",
+)
 STATUS_FINAL = frozenset({"succeeded", "skipped", "validation_failed"})
 STATUS_RETRYABLE = frozenset({"pending", "failed"})
 MAX_PLATE_NUMBER_LENGTH = 20
@@ -75,6 +80,10 @@ class BackendQueueJob:
     evidence: dict[str, str | None]
     image_statuses: dict[str, str] = field(default_factory=dict)
     log_statuses: dict[str, str] = field(default_factory=dict)
+    evidence_mode: str = "metadata"
+    evidence_delivery_status: str = "pending"
+    retention_status: str = "kept"
+    local_evidence_deleted: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -94,6 +103,10 @@ class BackendQueueJob:
             "evidence": self.evidence,
             "image_statuses": self.image_statuses,
             "log_statuses": self.log_statuses,
+            "evidence_mode": self.evidence_mode,
+            "evidence_delivery_status": self.evidence_delivery_status,
+            "retention_status": self.retention_status,
+            "local_evidence_deleted": self.local_evidence_deleted,
         }
 
     @classmethod
@@ -133,6 +146,10 @@ class BackendQueueJob:
             evidence=evidence,
             image_statuses=image_statuses,
             log_statuses=log_statuses,
+            evidence_mode=str(payload.get("evidence_mode", "metadata")),
+            evidence_delivery_status=str(payload.get("evidence_delivery_status", "pending")),
+            retention_status=str(payload.get("retention_status", "kept")),
+            local_evidence_deleted=int(payload.get("local_evidence_deleted", 0)),
         )
         return _normalize_job(job)
 
@@ -157,6 +174,7 @@ class FlushQueueResult:
     malformed: int = 0
     camera_verified: bool = False
     logs_sent: int = 0
+    images_sent: int = 0
 
 
 def _utc_now_iso() -> str:
@@ -196,7 +214,20 @@ def _normalize_job_log_statuses(job: BackendQueueJob) -> BackendQueueJob:
 
 
 def _normalize_job(job: BackendQueueJob) -> BackendQueueJob:
-    return _normalize_job_log_statuses(_normalize_job_image_statuses(job))
+    job = _normalize_job_log_statuses(_normalize_job_image_statuses(job))
+    if not job.evidence_mode:
+        job.evidence_mode = "metadata"
+    if not job.evidence_delivery_status:
+        job.evidence_delivery_status = "pending"
+    if not job.retention_status:
+        job.retention_status = "kept"
+    return job
+
+
+def _retention_policy_label(config: Config) -> str:
+    if config.evidence_retention_days <= 0:
+        return "keep_indefinite"
+    return f"delete_after_{config.evidence_retention_days}_days"
 
 
 def _count_succeeded_images(job: BackendQueueJob) -> int:
@@ -558,6 +589,10 @@ class BackendClient:
                 key: finalized_event.get("evidence", {}).get(key)
                 for key in EVIDENCE_IMAGE_TYPES
             },
+            evidence_mode=self.config.evidence_mode,
+            evidence_delivery_status="pending",
+            retention_status="kept",
+            local_evidence_deleted=0,
         )
         _normalize_job(job)
         jobs, _ = self.read_queue()
@@ -584,14 +619,18 @@ class BackendClient:
             "local_event_id": job.local_event_id,
             "plate_number": job.event.get("plate_number"),
         }
-        if stage == "ai_images_registered":
+        if stage in {"ai_images_registered", "ai_evidence_delivered", "ai_job_succeeded"}:
             payload["images_sent"] = _count_succeeded_images(job)
             payload["image_statuses"] = dict(job.image_statuses)
+        if stage == "ai_evidence_delivered":
+            payload["evidence_mode"] = job.evidence_mode
+            payload["retention_policy"] = _retention_policy_label(self.config)
+            payload["local_evidence_deleted"] = job.local_evidence_deleted
         if stage == "ai_job_succeeded":
-            payload["images_sent"] = _count_succeeded_images(job)
             payload["logs_sent"] = _count_succeeded_logs(job)
-            payload["image_statuses"] = dict(job.image_statuses)
             payload["log_statuses"] = dict(job.log_statuses)
+            payload["evidence_mode"] = job.evidence_mode
+            payload["evidence_delivery_status"] = job.evidence_delivery_status
         return json.dumps(payload, separators=(",", ":"))
 
     def _post_event_log(self, backend_event_id: str, stage: str, message: str) -> None:
@@ -746,6 +785,11 @@ class BackendClient:
         job.images_sent = _count_succeeded_images(job)
         job.logs_sent = _count_succeeded_logs(job)
 
+        if job.evidence_delivery_status == "pending" and (
+            job.backend_event_id or job.images_sent > 0
+        ):
+            job.evidence_delivery_status = "failed"
+
         if message == UPLOAD_MODE_ERROR or (
             isinstance(exc, BackendApiError) and exc.is_validation_failure()
         ):
@@ -804,6 +848,9 @@ class BackendClient:
                 job, backend_event_id, "ai_images_registered", all_jobs, job_index
             )
             self._send_stage_log_if_pending(
+                job, backend_event_id, "ai_evidence_delivered", all_jobs, job_index
+            )
+            self._send_stage_log_if_pending(
                 job, backend_event_id, "ai_job_succeeded", all_jobs, job_index
             )
 
@@ -816,6 +863,8 @@ class BackendClient:
 
             job.images_sent = _count_succeeded_images(job)
             job.logs_sent = _count_succeeded_logs(job)
+            job.evidence_delivery_status = "succeeded"
+            job.retention_status = "kept"
             job.status = "succeeded"
             job.last_error = None
             job.updated_at = _utc_now_iso()
@@ -893,6 +942,7 @@ class BackendClient:
         exhausted = 0
         skipped = 0
         logs_sent = 0
+        images_sent = 0
 
         for index, job in enumerate(jobs):
             if job.status in QUEUE_STATUSES_SKIP:
@@ -916,10 +966,12 @@ class BackendClient:
                 continue
 
             before_logs = job.logs_sent
+            before_images = job.images_sent
             processed += 1
             jobs[index] = self._process_job(jobs[index], jobs, index)
             job = jobs[index]
             logs_sent += max(0, job.logs_sent - before_logs)
+            images_sent += max(0, job.images_sent - before_images)
 
             if job.status == "succeeded":
                 succeeded += 1
@@ -945,6 +997,7 @@ class BackendClient:
             malformed=malformed,
             camera_verified=camera_verified,
             logs_sent=logs_sent,
+            images_sent=images_sent,
         )
 
     def job_results_for_local_events(
@@ -965,6 +1018,10 @@ class BackendClient:
                 "logs_sent": job.logs_sent,
                 "image_statuses": dict(job.image_statuses),
                 "log_statuses": dict(job.log_statuses),
+                "evidence_mode": job.evidence_mode,
+                "evidence_delivery_status": job.evidence_delivery_status,
+                "retention_status": job.retention_status,
+                "local_evidence_deleted": job.local_evidence_deleted,
                 "last_error": job.last_error,
             }
         return results
