@@ -15,11 +15,6 @@ VALID_DEVICES = frozenset({"cpu", "cuda"})
 VALID_EVIDENCE_MODES = frozenset({"metadata", "upload"})
 VALID_OCR_ENGINES = frozenset({"paddleocr"})
 
-UPLOAD_MODE_ERROR = (
-    "ANPR_EVIDENCE_MODE=upload is designed for M9 but unsupported until the Laravel backend "
-    "exposes a multipart image upload endpoint. Use ANPR_EVIDENCE_MODE=metadata."
-)
-
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
@@ -537,7 +532,9 @@ def _validate_evidence_mode(config: Config, result: ValidationResult) -> None:
     result.add_info(f"OK: evidence mode configured: {config.evidence_mode}")
 
     if config.evidence_mode == "upload" and config.backend_enabled:
-        result.add_error(UPLOAD_MODE_ERROR)
+        result.add_info(
+            "OK: upload mode will send evidence files to Laravel-owned storage."
+        )
 
     if config.evidence_mode == "metadata":
         project_root = config.project_root_path()
@@ -546,16 +543,15 @@ def _validate_evidence_mode(config: Config, result: ValidationResult) -> None:
         )
         if config.backend_enabled:
             result.add_warning(
-                "Metadata mode requires Laravel to resolve local evidence paths. Configure "
-                "Laravel ANPR_IMAGE_ROOTS (or equivalent) to include the AI ANPR project root, "
-                f"for example: ANPR_IMAGE_ROOTS={project_root}"
+                "Metadata mode sends local evidence paths. Laravel must resolve those paths "
+                "through ANPR_IMAGE_ROOTS. Use upload mode for cloud backend deployment."
             )
 
     if config.delete_local_after_upload:
         if config.evidence_mode == "upload":
-            result.add_warning(
-                "ANPR_DELETE_LOCAL_AFTER_UPLOAD is set but upload mode is unsupported in M9; "
-                "local evidence will not be deleted."
+            result.add_info(
+                "OK: local evidence will be deleted after successful upload when "
+                "ANPR_DELETE_LOCAL_AFTER_UPLOAD=true."
             )
         elif config.evidence_mode == "metadata":
             result.add_warning(

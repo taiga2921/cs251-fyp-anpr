@@ -33,11 +33,13 @@ ANPR_PLATE_MODEL=models/plate/license-plate-finetune-v1s.pt
 ANPR_BACKEND_ENABLED=false
 ANPR_BACKEND_BASE_URL=http://localhost:8000/api
 ANPR_BACKEND_CAMERA_ID=
-ANPR_EVIDENCE_MODE=metadata
+ANPR_EVIDENCE_MODE=upload
 ANPR_EVIDENCE_RETENTION_DAYS=0
 ```
 
-**Metadata mode** is the supported M9 evidence path. **Upload mode** is design-only until Laravel adds a multipart upload endpoint. When using metadata mode, configure Laravel to resolve evidence paths (see `check-config` warning for `ANPR_IMAGE_ROOTS`).
+**Upload mode** is the recommended backend/cloud evidence path. The AI runtime uploads evidence files to Laravel, and Laravel stores them under `storage/app/anpr`.
+
+**Metadata mode** is retained for local development only and requires Laravel `ANPR_IMAGE_ROOTS` to resolve AI-local `runs/` paths.
 
 ## CLI
 

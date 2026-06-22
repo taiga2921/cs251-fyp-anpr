@@ -192,7 +192,11 @@ Raw backend event payloads are not rendered on the detail page to avoid exposing
 
 ## Evidence Display Strategy
 
-The backend stores **`file_path`** as metadata. When the file resolves under configured `ANPR_IMAGE_ROOTS`, Laravel exposes:
+Normal operational flow is **upload mode** → Laravel stores files under `storage/app/anpr` → `AnprImageResource` exposes protected preview URLs.
+
+The backend stores **`file_path`** relative to the ANPR image root. For uploaded evidence, Laravel resolves files under `storage/app/anpr` by default. For metadata mode (local development fallback), paths resolve when `ANPR_IMAGE_ROOTS` includes the AI `runs/` directory.
+
+Laravel exposes:
 
 - `url` and `image_url` pointing to `GET /api/anpr-images/{id}/file`
 - A protected file response that rejects path traversal and unavailable files
@@ -201,7 +205,7 @@ The frontend evidence gallery:
 
 1. Uses `url` / `image_url` from normalized image payloads
 2. Fetches protected file URLs with the JWT `Authorization` header and renders a blob preview
-3. Shows a professional **Preview unavailable** card with metadata when no resolvable URL exists or loading fails
+3. Shows a **Preview unavailable** placeholder when no resolvable URL exists or loading fails (common in metadata-only setups without configured roots)
 
 ## Routing and Permissions
 
@@ -276,5 +280,4 @@ Potential follow-ups for M11:
 
 - Optional polling or WebSocket push for new detections
 - Date-range filters in the frontend UI (`date_from`, `date_to` already supported by backend)
-- Binary evidence upload endpoint if upload mode is activated
 - Optional operator-facing lifecycle log viewer separate from the main monitoring UI

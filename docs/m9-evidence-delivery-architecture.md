@@ -2,7 +2,7 @@
 
 ## Milestone Summary
 
-Milestone 9 (M9) completes **evidence delivery** for the AI ANPR runtime. Finalized detections register image metadata with Laravel, record evidence delivery in event logs, and retain local evidence under a configurable policy. **Metadata mode** is the supported operational path; **upload mode** remains documented but unsupported until the backend exposes multipart upload.
+Milestone 9 (M9) completes **evidence delivery** for the AI ANPR runtime. Finalized detections register evidence with Laravel (metadata paths or uploaded files), record evidence delivery in event logs, and retain local evidence under a configurable policy. **Metadata mode** remains supported for local development. **Upload mode** is operational after the M10 backend-owned evidence patch and is the preferred cloud deployment path.
 
 ## Objective
 
@@ -15,29 +15,29 @@ Ensure backend event detail references all available evidence through backend-co
 ### In Scope
 
 - Metadata mode hardening (`full`, `plate`, `annotated`)
+- Upload mode multipart delivery to Laravel `storage/app/anpr` (M10)
 - Image path normalization and operator-facing image-root compatibility guidance
 - Evidence delivery log stage (`ai_evidence_delivered`)
 - Queue schema extensions for delivery/retention state
+- Per-job `evidence_mode` durability (queue flush uses stored mode, not current `.env`)
 - Local evidence retention for expired runs (not current run)
 - M9 runtime summary and `backend_results.json` fields
-- Upload mode rejection with M9 messaging
 
 ### Out of Scope
 
-- Binary image upload (no backend endpoint)
-- Cloud storage
+- Cloud storage backends beyond Laravel local disk
 - Frontend ANPR monitoring UI
 - WebSocket/realtime features
 - Detection, OCR, tracking, or voting changes
-- Laravel code changes
 
 ## File-by-File Responsibilities
 
 ### `backend.py`
 
-- Metadata image posting, event logs including `ai_evidence_delivered`
+- Metadata image posting and multipart upload delivery
+- Event logs including `ai_evidence_delivered`
 - Queue delivery fields, per-row checkpointing
-- Upload mode rejection
+- Per-job `evidence_mode` routing
 
 ### `anpr.py`
 
@@ -47,8 +47,7 @@ Ensure backend event detail references all available evidence through backend-co
 
 ### `config.py`
 
-- `ANPR_EVIDENCE_RETENTION_DAYS`, metadata image-root warnings
-- M9 upload mode error text
+- `ANPR_EVIDENCE_RETENTION_DAYS`, metadata image-root warnings, upload mode info
 
 ### `main.py`
 
@@ -56,10 +55,10 @@ Ensure backend event detail references all available evidence through backend-co
 
 ## Evidence Delivery Modes
 
-| Mode | M9 status |
-| ---- | --------- |
-| `metadata` | **Supported** — posts `anpr_images` metadata rows |
-| `upload` | **Unsupported** — rejected before event posting |
+| Mode | Status |
+| ---- | ------ |
+| `metadata` | **Supported** — posts `anpr_images` metadata rows (local development) |
+| `upload` | **Operational (M10)** — uploads binary files to Laravel `storage/app/anpr` |
 
 ## Metadata Mode Behavior
 
@@ -81,13 +80,11 @@ Evidence paths are stored relative to the AI ANPR project root (current working 
 ANPR_IMAGE_ROOTS=D:/path/to/ai-anpr-v1
 ```
 
-`check-config` emits a **warning** when metadata mode and backend are enabled. The Python runtime does not read Laravel `.env` and does not fail config if Laravel roots are unverified.
+`check-config` emits a **warning** when metadata mode and backend are enabled. Upload mode does not require `ANPR_IMAGE_ROOTS` on the AI machine.
 
-## Upload Mode Design and Current Unsupported Status
+## Upload Mode (M10)
 
-**Current:** No multipart upload endpoint exists in `backend-laravel-v1`. Upload mode is rejected before any `POST /api/anpr-events`.
-
-**Future contract (design only):**
+Upload mode posts binary evidence files to Laravel:
 
 ```text
 POST /api/anpr-events/{event_id}/images/upload
@@ -96,7 +93,9 @@ multipart/form-data:
   image=@file.jpg
 ```
 
-Backend-owned files are the preferred long-term architecture. M9 continues to use metadata mode operationally.
+Laravel stores files under `storage/app/anpr/events/{event_id}/` and creates or updates `anpr_images` rows. The queue processes each job using its stored `evidence_mode`, so old metadata jobs are not broken by later `.env` changes.
+
+Backend-owned files are the preferred cloud deployment path.
 
 ## Evidence Delivery Logs
 
@@ -140,7 +139,7 @@ Older queue lines normalize missing fields on read.
 | `ANPR_EVIDENCE_RETENTION_DAYS>0` | Delete evidence files in **old** runs past retention age |
 | Current run | Never deleted by retention cleanup |
 | Metadata mode | Does not delete evidence after metadata registration |
-| `ANPR_DELETE_LOCAL_AFTER_UPLOAD=true` | Ignored in metadata mode; ineffective while upload unsupported |
+| `ANPR_DELETE_LOCAL_AFTER_UPLOAD=true` (upload mode) | Deletes local run evidence files after all uploads succeed |
 
 Deletion is limited to files under `runs/*/evidence/` within the configured runs directory.
 
@@ -161,6 +160,7 @@ Deletion is limited to files under `runs/*/evidence/` within the configured runs
   "backend_jobs_queued": 1,
   "backend_jobs_succeeded": 1,
   "backend_images_sent": 3,
+  "backend_images_uploaded": 3,
   "backend_logs_sent": 4,
   "local_evidence_deleted": 0,
   "backend_queue_file": ".cache/backend_queue.jsonl"
@@ -180,11 +180,12 @@ python main.py flush-backend-queue
 
 ## Passing Criteria
 
-- Backend event detail includes all available evidence metadata
+- Backend event detail includes all available evidence (metadata or uploaded files)
 - Metadata mode registers `full`, `plate`, `annotated` when paths exist
+- Upload mode stores files under Laravel `storage/app/anpr`
 - `ai_evidence_delivered` log visible in Laravel
 - Re-flush does not duplicate events, images, or logs
-- Upload mode fails early with clear M9 message
+- Queue jobs use stored `evidence_mode` even if `.env` changes later
 - Dry-run has no backend side effects
 - M4–M8 behavior preserved
 
@@ -210,11 +211,20 @@ Verify: one event, image rows, evidence delivery log, no duplicates on second fl
 
 ## Known Limitations
 
-- Upload mode not operational
-- Metadata paths require Laravel image root configuration
+- Metadata paths require Laravel `ANPR_IMAGE_ROOTS` configuration on the AI machine
 - Retention deletes old run evidence only; metadata may reference deleted files if retention is aggressive
 - No `vehicle_id` linkage
 
+## M10 Backend-Owned Evidence Upload Patch
+
+Upload mode now posts binary evidence files to Laravel:
+
+```text
+POST /api/anpr-events/{event_id}/images/upload
+```
+
+The queue processes each job using its stored `evidence_mode`, so old metadata jobs are not broken by later `.env` changes.
+
 ## M10 Handoff Notes
 
-M10 — Frontend ANPR monitoring UI: display events, images, and logs from Laravel API. Ensure dashboard reads `anpr_images` metadata and resolves or proxies evidence paths as configured.
+M10 — Frontend ANPR monitoring UI displays events and evidence from Laravel. Upload mode is the normal operational path for cloud backends; metadata mode remains a local-development fallback.

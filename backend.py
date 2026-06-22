@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import tempfile
 import uuid
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
-from config import Config, UPLOAD_MODE_ERROR
+from config import VALID_EVIDENCE_MODES, Config
 
 TOKEN_EXPIRY_BUFFER_SECONDS = 60
 QUEUE_STATUSES_SKIP = frozenset({"succeeded", "exhausted", "validation_failed"})
@@ -245,6 +246,33 @@ def _normalize_evidence_path(path: str | None) -> str | None:
     return normalized[:MAX_FILE_PATH_LENGTH]
 
 
+def _build_multipart_body(
+    fields: dict[str, str],
+    files: dict[str, tuple[str, bytes, str]],
+) -> tuple[bytes, str]:
+    boundary = f"----AnprFormBoundary{uuid.uuid4().hex}"
+    parts: list[bytes] = []
+    boundary_bytes = boundary.encode("ascii")
+
+    for name, value in fields.items():
+        parts.append(b"--" + boundary_bytes)
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}'.encode("utf-8")
+        )
+
+    for name, (filename, content, content_type) in files.items():
+        parts.append(b"--" + boundary_bytes)
+        header = (
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+        parts.append(header + content)
+
+    parts.append(b"--" + boundary_bytes + b"--\r\n")
+    body = b"\r\n".join(parts)
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
 def _sanitize_plate_number(plate_number: str) -> str:
     plate = plate_number.strip().upper()
     if not plate:
@@ -447,6 +475,82 @@ class BackendClient:
                 path=path,
             ) from exc
 
+    def _request_multipart(
+        self,
+        method: str,
+        path: str,
+        fields: dict[str, str],
+        files: dict[str, tuple[str, bytes, str]],
+        *,
+        authorized: bool = True,
+        retry_on_401: bool = True,
+        token: BackendToken | None = None,
+    ) -> dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        body, content_type = _build_multipart_body(fields, files)
+        req_headers = {
+            "Accept": "application/json",
+            "Content-Type": content_type,
+        }
+
+        if authorized:
+            token = token or self.get_valid_token()
+            req_headers["Authorization"] = f"{token.token_type} {token.access_token}"
+
+        http_request = request.Request(url, data=body, headers=req_headers, method=method)
+
+        try:
+            with request.urlopen(http_request, timeout=self.config.backend_timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8")
+                if not raw.strip():
+                    return {}
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    raise BackendApiError(
+                        f"Unexpected non-object response from {path}.",
+                        path=path,
+                    )
+                return parsed
+        except error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            parsed: dict[str, Any] = {}
+            if raw.strip():
+                try:
+                    loaded = json.loads(raw)
+                    if isinstance(loaded, dict):
+                        parsed = loaded
+                except json.JSONDecodeError:
+                    parsed = {"message": raw}
+
+            if exc.code == 401 and authorized and retry_on_401:
+                refreshed = self.get_valid_token(force_refresh=True)
+                return self._request_multipart(
+                    method,
+                    path,
+                    fields,
+                    files,
+                    authorized=True,
+                    retry_on_401=False,
+                    token=refreshed,
+                )
+
+            message = str(parsed.get("message") or exc.reason or "HTTP error")
+            errors: dict[str, Any] | None = None
+            data = parsed.get("data")
+            if isinstance(data, dict) and isinstance(data.get("errors"), dict):
+                errors = data["errors"]
+            raise BackendApiError(
+                f"HTTP {exc.code} for {path}: {message}",
+                status_code=exc.code,
+                path=path,
+                errors=errors,
+            ) from exc
+        except error.URLError as exc:
+            raise BackendApiError(
+                f"Network error for {path}: {exc.reason}",
+                path=path,
+            ) from exc
+
     def verify_camera_mapping(self) -> None:
         """Confirm configured camera UUID exists in Laravel."""
         if self._camera_verified_for_flush:
@@ -624,6 +728,8 @@ class BackendClient:
             payload["image_statuses"] = dict(job.image_statuses)
         if stage == "ai_evidence_delivered":
             payload["evidence_mode"] = job.evidence_mode
+            if job.evidence_mode == "upload":
+                payload["backend_owned_storage"] = True
             payload["retention_policy"] = _retention_policy_label(self.config)
             payload["local_evidence_deleted"] = job.local_evidence_deleted
         if stage == "ai_job_succeeded":
@@ -683,6 +789,33 @@ class BackendClient:
             "expires_at": None,
         }
         self._request("POST", "/anpr-images", payload, headers={})
+
+    def upload_event_image(
+        self,
+        backend_event_id: str,
+        image_type: str,
+        image_path: str,
+    ) -> dict[str, Any]:
+        path = Path(image_path)
+        if not path.is_file():
+            raise BackendApiError(
+                f"Local evidence file not found: {image_path}",
+                status_code=422,
+                path=f"/anpr-events/{backend_event_id}/images/upload",
+            )
+
+        content = path.read_bytes()
+        mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        response = self._request_multipart(
+            "POST",
+            f"/anpr-events/{backend_event_id}/images/upload",
+            {"image_type": image_type},
+            {"image": (path.name, content, mime_type)},
+        )
+        data = response.get("data")
+        if isinstance(data, dict):
+            return data
+        return {}
 
     def _apply_api_failure_to_job(
         self,
@@ -753,6 +886,34 @@ class BackendClient:
             job.images_sent = _count_succeeded_images(job)
             self._checkpoint_job_if_available(job, all_jobs, job_index)
 
+    def _send_pending_image_uploads(
+        self,
+        job: BackendQueueJob,
+        backend_event_id: str,
+        all_jobs: list[BackendQueueJob] | None = None,
+        job_index: int | None = None,
+    ) -> None:
+        for image_type in EVIDENCE_IMAGE_TYPES:
+            status = job.image_statuses.get(image_type)
+            if status in STATUS_FINAL:
+                continue
+
+            file_path = job.evidence.get(image_type)
+            if not file_path or not Path(str(file_path)).is_file():
+                job.image_statuses[image_type] = "skipped"
+                continue
+
+            try:
+                self.upload_event_image(backend_event_id, image_type, str(file_path))
+            except BackendApiError as exc:
+                self._apply_api_failure_to_job(
+                    job, bucket=job.image_statuses, key=image_type, exc=exc
+                )
+
+            job.image_statuses[image_type] = "succeeded"
+            job.images_sent = _count_succeeded_images(job)
+            self._checkpoint_job_if_available(job, all_jobs, job_index)
+
     def _pending_image_types(self, job: BackendQueueJob) -> list[str]:
         pending: list[str] = []
         for image_type in EVIDENCE_IMAGE_TYPES:
@@ -770,9 +931,48 @@ class BackendClient:
                 pending.append(stage)
         return pending
 
-    def _ensure_upload_mode_supported(self) -> None:
-        if self.config.backend_enabled and self.config.evidence_mode == "upload":
-            raise BackendApiError(UPLOAD_MODE_ERROR, status_code=422, path="/anpr-events")
+    def _is_safe_evidence_path(self, path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+
+        runs_dir = self.config.project_root_path() / self.config.runs_dir
+        try:
+            runs_dir = runs_dir.resolve()
+            relative = resolved.relative_to(runs_dir)
+        except ValueError:
+            return False
+
+        return "evidence" in relative.parts
+
+    def _delete_local_evidence_if_configured(self, job: BackendQueueJob) -> None:
+        job_evidence_mode = job.evidence_mode or self.config.evidence_mode
+        if job_evidence_mode != "upload" or not self.config.delete_local_after_upload:
+            return
+
+        for image_type in EVIDENCE_IMAGE_TYPES:
+            status = job.image_statuses.get(image_type)
+            if status in {"failed", "pending"}:
+                return
+
+        deleted = 0
+        for image_type in EVIDENCE_IMAGE_TYPES:
+            file_path = job.evidence.get(image_type)
+            if not file_path:
+                continue
+            path = Path(str(file_path))
+            if not self._is_safe_evidence_path(path) or not path.is_file():
+                continue
+            try:
+                path.unlink()
+                deleted += 1
+            except OSError:
+                continue
+
+        if deleted:
+            job.local_evidence_deleted = deleted
+            job.retention_status = "deleted_after_upload"
 
     def _mark_job_failure(self, job: BackendQueueJob, exc: Exception) -> BackendQueueJob:
         if isinstance(exc, BackendApiError):
@@ -790,9 +990,7 @@ class BackendClient:
         ):
             job.evidence_delivery_status = "failed"
 
-        if message == UPLOAD_MODE_ERROR or (
-            isinstance(exc, BackendApiError) and exc.is_validation_failure()
-        ):
+        if isinstance(exc, BackendApiError) and exc.is_validation_failure():
             job.status = "validation_failed"
             return job
 
@@ -815,7 +1013,12 @@ class BackendClient:
         job.updated_at = now
 
         try:
-            self._ensure_upload_mode_supported()
+            job_evidence_mode = job.evidence_mode or self.config.evidence_mode
+            if job_evidence_mode not in VALID_EVIDENCE_MODES:
+                job.status = "validation_failed"
+                job.last_error = f"Unknown evidence_mode: {job_evidence_mode}"
+                job.updated_at = _utc_now_iso()
+                return job
 
             backend_event_id = job.backend_event_id
             event_created = False
@@ -833,16 +1036,25 @@ class BackendClient:
                 job, backend_event_id, "ai_event_created", all_jobs, job_index
             )
 
-            if self.config.evidence_mode == "metadata":
+            if job_evidence_mode == "metadata":
                 self._send_pending_image_metadata(
                     job, backend_event_id, all_jobs, job_index
                 )
-                pending_images = self._pending_image_types(job)
-                if pending_images:
-                    raise BackendApiError(
-                        "Image metadata incomplete for: " + ", ".join(pending_images),
-                        path="/anpr-images",
-                    )
+            elif job_evidence_mode == "upload":
+                self._send_pending_image_uploads(
+                    job, backend_event_id, all_jobs, job_index
+                )
+
+            pending_images = self._pending_image_types(job)
+            if pending_images:
+                raise BackendApiError(
+                    "Evidence delivery incomplete for: " + ", ".join(pending_images),
+                    path=(
+                        "/anpr-images"
+                        if job_evidence_mode == "metadata"
+                        else f"/anpr-events/{backend_event_id}/images/upload"
+                    ),
+                )
 
             self._send_stage_log_if_pending(
                 job, backend_event_id, "ai_images_registered", all_jobs, job_index
@@ -864,7 +1076,8 @@ class BackendClient:
             job.images_sent = _count_succeeded_images(job)
             job.logs_sent = _count_succeeded_logs(job)
             job.evidence_delivery_status = "succeeded"
-            job.retention_status = "kept"
+            self._delete_local_evidence_if_configured(job)
+            job.retention_status = job.retention_status or "kept"
             job.status = "succeeded"
             job.last_error = None
             job.updated_at = _utc_now_iso()
@@ -881,11 +1094,6 @@ class BackendClient:
             )
 
         self._camera_verified_for_flush = False
-
-        try:
-            self._ensure_upload_mode_supported()
-        except BackendApiError as exc:
-            return FlushQueueResult(success=False, message=exc.message)
 
         jobs, malformed = self.read_queue()
         if malformed:
@@ -1015,6 +1223,9 @@ class BackendClient:
                 "status": job.status,
                 "backend_event_id": job.backend_event_id,
                 "images_sent": job.images_sent,
+                "backend_images_uploaded": (
+                    job.images_sent if job.evidence_mode == "upload" else 0
+                ),
                 "logs_sent": job.logs_sent,
                 "image_statuses": dict(job.image_statuses),
                 "log_statuses": dict(job.log_statuses),
