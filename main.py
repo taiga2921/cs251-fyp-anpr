@@ -1,4 +1,4 @@
-"""CLI entry point for AI ANPR (M6)."""
+"""CLI entry point for AI ANPR (M7)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-anpr",
-        description="AI ANPR CLI — M6 final event and evidence architecture",
+        description="AI ANPR CLI — M7 backend client and queue architecture",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -29,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run ANPR processing (M6 supports --dry-run with events and evidence)",
+        help="Run ANPR processing (M7 supports dry-run and backend-enabled runs)",
     )
     run_parser.add_argument(
         "--source",
@@ -61,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Open source, load models, run detection/OCR, and write run output",
+        help="Local events/evidence only; no backend enqueue or posting",
     )
     run_parser.add_argument(
         "--strict",
@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "flush-backend-queue",
-        help="Flush pending backend queue items (placeholder; no network activity)",
+        help="Flush pending backend queue jobs to the Laravel API",
     )
 
     return parser
@@ -99,38 +99,7 @@ def cmd_check_config(config: Config, args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
-def cmd_run(config: Config, args: argparse.Namespace) -> int:
-    if getattr(args, "source_path", None) and is_rtsp_source_path(args.source_path):
-        print(f"ERROR: {RTSP_URL_CLI_ERROR}")
-        return 1
-
-    config.apply_cli_overrides(args)
-
-    if not args.dry_run:
-        print(
-            "Non-dry-run ANPR execution is not implemented until later milestones.\n"
-            "Use --dry-run to open the source, load models, and run local event/evidence output."
-        )
-        return 2
-
-    result = validate_config(config, strict=args.strict)
-    if not result.ok:
-        print("Configuration validation failed before dry-run:")
-        print(format_validation_output(result))
-        return 1
-
-    processor = ANPRProcessor(config)
-    dry_run = processor.run_dry_run(result, strict=args.strict)
-
-    if dry_run.summary.get("status") == "failed":
-        error = dry_run.summary.get("errors", ["Unknown runtime error"])
-        print(f"ERROR: {error[0] if error else 'Dry-run failed.'}")
-        print(f"Run directory: {dry_run.run_dir}")
-        print(f"Worker log: {dry_run.worker_log}")
-        print(f"Worker summary: {dry_run.worker_summary}")
-        return 1
-
-    print("Dry-run completed successfully.")
+def _print_run_summary(dry_run) -> None:
     print(f"Run directory: {dry_run.run_dir}")
     print(f"Frames read: {dry_run.summary.get('frames_read', 0)}")
     print(f"Frames processed: {dry_run.summary.get('frames_processed', 0)}")
@@ -148,9 +117,51 @@ def cmd_run(config: Config, args: argparse.Namespace) -> int:
     print(f"Events written: {dry_run.summary.get('events_written', 0)}")
     print(f"Evidence files saved: {dry_run.summary.get('evidence_files_saved', 0)}")
     print(f"Duplicate events suppressed: {dry_run.summary.get('duplicate_events_suppressed', 0)}")
+    print(f"Backend jobs queued: {dry_run.summary.get('backend_jobs_queued', 0)}")
+    print(f"Backend jobs succeeded: {dry_run.summary.get('backend_jobs_succeeded', 0)}")
+    print(f"Backend jobs failed: {dry_run.summary.get('backend_jobs_failed', 0)}")
+    print(f"Backend jobs exhausted: {dry_run.summary.get('backend_jobs_exhausted', 0)}")
     print(f"Worker log: {dry_run.worker_log}")
     print(f"Worker summary: {dry_run.worker_summary}")
     print(f"Events file: {dry_run.events_file}")
+
+
+def cmd_run(config: Config, args: argparse.Namespace) -> int:
+    if getattr(args, "source_path", None) and is_rtsp_source_path(args.source_path):
+        print(f"ERROR: {RTSP_URL_CLI_ERROR}")
+        return 1
+
+    config.apply_cli_overrides(args)
+
+    if not args.dry_run and not config.backend_enabled:
+        print(
+            "ERROR: Non-dry-run execution requires ANPR_BACKEND_ENABLED=true.\n"
+            "Use --dry-run for local-only validation."
+        )
+        return 1
+
+    result = validate_config(config, strict=args.strict)
+    if not result.ok:
+        print("Configuration validation failed before run:")
+        print(format_validation_output(result))
+        return 1
+
+    processor = ANPRProcessor(config)
+    run_result = (
+        processor.run_dry_run(result, strict=args.strict)
+        if args.dry_run
+        else processor.run(result, strict=args.strict)
+    )
+
+    if run_result.summary.get("status") == "failed":
+        error = run_result.summary.get("errors", ["Unknown runtime error"])
+        print(f"ERROR: {error[0] if error else 'Run failed.'}")
+        _print_run_summary(run_result)
+        return 1
+
+    label = "Dry-run completed successfully." if args.dry_run else "Run completed successfully."
+    print(label)
+    _print_run_summary(run_result)
     if result.warnings:
         print(f"Warnings ({len(result.warnings)}):")
         for warning in result.warnings:
@@ -158,10 +169,26 @@ def cmd_run(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_flush_backend_queue() -> int:
-    client = BackendClient()
+def cmd_flush_backend_queue(config: Config) -> int:
+    if not config.backend_enabled:
+        print("Backend disabled (ANPR_BACKEND_ENABLED=false). No jobs to flush.")
+        return 0
+
+    result = validate_config(config, strict=True)
+    if not result.ok:
+        print("Configuration validation failed before queue flush:")
+        print(format_validation_output(result))
+        return 1
+
+    client = BackendClient(config)
     flush_result = client.flush_queue()
     print(flush_result.message)
+    print(f"Processed: {flush_result.processed}")
+    print(f"Succeeded: {flush_result.succeeded}")
+    print(f"Failed: {flush_result.failed}")
+    print(f"Exhausted: {flush_result.exhausted}")
+    print(f"Skipped: {flush_result.skipped}")
+    print(f"Pending: {flush_result.pending}")
     return 0 if flush_result.success else 1
 
 
@@ -175,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         return cmd_run(config, args)
     if args.command == "flush-backend-queue":
-        return cmd_flush_backend_queue()
+        return cmd_flush_backend_queue(config)
 
     parser.print_help()
     return 2

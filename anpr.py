@@ -1,4 +1,4 @@
-"""ANPR runtime with M6 final event and evidence architecture."""
+"""ANPR runtime with M7 backend client and queue architecture."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 
 from config import Config, ValidationResult
+from backend import BackendClient
 
 ASSUMED_VIDEO_FPS = 30.0
 VEHICLE_CLASS_NAMES = frozenset({"car", "motorcycle", "bus", "truck"})
@@ -199,6 +200,10 @@ class RuntimeMetrics:
     evidence_files_saved: int = 0
     evidence_save_failures: int = 0
     duplicate_events_suppressed: int = 0
+    backend_jobs_queued: int = 0
+    backend_jobs_succeeded: int = 0
+    backend_jobs_failed: int = 0
+    backend_jobs_exhausted: int = 0
 
 
 @dataclass
@@ -440,6 +445,26 @@ def _default_backend_state() -> dict[str, object]:
     }
 
 
+def _backend_state_queued() -> dict[str, object]:
+    return {
+        "queued": True,
+        "posted": False,
+        "event_id": None,
+        "images_sent": 0,
+        "error": None,
+    }
+
+
+def _backend_state_enqueue_failed(error: str) -> dict[str, object]:
+    return {
+        "queued": False,
+        "posted": False,
+        "event_id": None,
+        "images_sent": 0,
+        "error": error,
+    }
+
+
 def finalized_event_to_dict(event: FinalizedEvent) -> dict[str, object]:
     """Convert a FinalizedEvent to a JSON-serializable dict."""
     payload: dict[str, object] = {}
@@ -480,6 +505,8 @@ class ANPRProcessor:
         self._events_file: Path | None = None
         self._evidence_dirs: dict[str, Path] = {}
         self._plate_last_event_at: dict[str, float] = {}
+        self._dry_run: bool = True
+        self._backend_client: BackendClient | None = None
 
     def _make_run_dir(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -954,6 +981,34 @@ class ANPRProcessor:
         vehicle_bbox, plate_bbox = self._event_bboxes(track, plate_number)
         evidence = self._save_evidence_images(track, event_id, candidate, metrics)
 
+        backend_state = _default_backend_state()
+        if (
+            not self._dry_run
+            and self.config.backend_enabled
+            and self._backend_client is not None
+        ):
+            event_dict_preview = {
+                "event_id": event_id,
+                "plate_number": plate_number,
+                "confidence": candidate.confidence,
+                "last_seen_at": candidate.last_seen_at,
+                "created_at": _utc_now_iso(),
+                "source_type": self.config.source,
+                "evidence": evidence,
+            }
+            enqueue_result = self._backend_client.enqueue_event(event_dict_preview)
+            if enqueue_result.success:
+                backend_state = _backend_state_queued()
+                metrics.backend_jobs_queued += 1
+                metrics.log_lines.append(
+                    f"Backend job queued: {event_id} job_id={enqueue_result.job_id}"
+                )
+            else:
+                backend_state = _backend_state_enqueue_failed(enqueue_result.message)
+                metrics.log_lines.append(
+                    f"Backend enqueue failed for {event_id}: {enqueue_result.message}"
+                )
+
         event = FinalizedEvent(
             event_id=event_id,
             run_id=self._run_id,
@@ -971,8 +1026,8 @@ class ANPRProcessor:
             vehicle_bbox=vehicle_bbox,
             plate_bbox=plate_bbox,
             evidence=evidence,
-            backend=_default_backend_state(),
-            dry_run=True,
+            backend=backend_state,
+            dry_run=self._dry_run,
             created_at=_utc_now_iso(),
         )
         self.write_event_record(self._events_file, event)
@@ -1353,7 +1408,7 @@ class ANPRProcessor:
         ]
         summary: dict = {
             "status": status,
-            "milestone": "M6",
+            "milestone": "M7",
             "source_type": self.config.source,
             "source_path": self._safe_source_path(),
             "frames_read": metrics.frames_read,
@@ -1365,6 +1420,11 @@ class ANPRProcessor:
             "duplicate_events_suppressed": metrics.duplicate_events_suppressed,
             "finalized_events": events_summary,
             "backend_enabled": self.config.backend_enabled,
+            "backend_jobs_queued": metrics.backend_jobs_queued,
+            "backend_jobs_succeeded": metrics.backend_jobs_succeeded,
+            "backend_jobs_failed": metrics.backend_jobs_failed,
+            "backend_jobs_exhausted": metrics.backend_jobs_exhausted,
+            "backend_queue_file": self.config.backend_queue_file,
             "validation_mode": "strict" if strict else "standard",
             "warnings": warnings,
             "errors": [metrics.runtime_error] if metrics.runtime_error else [],
@@ -1468,11 +1528,34 @@ class ANPRProcessor:
         *,
         strict: bool = False,
     ) -> DryRunResult:
+        """Run the pipeline in dry-run mode without backend side effects."""
+        return self._execute_run(validation_result, strict=strict, dry_run=True)
+
+    def run(
+        self,
+        validation_result: ValidationResult,
+        *,
+        strict: bool = False,
+    ) -> DryRunResult:
+        """Run the pipeline with local events and optional backend queue enqueue."""
+        return self._execute_run(validation_result, strict=strict, dry_run=False)
+
+    def _execute_run(
+        self,
+        validation_result: ValidationResult,
+        *,
+        strict: bool = False,
+        dry_run: bool = True,
+    ) -> DryRunResult:
         """
         Open source, load models, read frames, run detection/OCR/tracking, and write outputs.
 
-        M6 dry-run persists local events and evidence; backend calls are not performed.
+        Dry-run persists local events only. Non-dry-run may enqueue backend jobs.
         """
+        self._dry_run = dry_run
+        self._backend_client = (
+            BackendClient(self.config) if self.config.backend_enabled and not dry_run else None
+        )
         run_dir = self._make_run_dir()
         self._run_dir = run_dir
         self._run_id = run_dir.name
@@ -1491,10 +1574,13 @@ class ANPRProcessor:
 
         metrics.log_lines.extend(
             [
-                "M6 dry-run started.",
+                f"{'M6 dry-run' if dry_run else 'M7 run'} started.",
                 f"Source type: {self.config.source}",
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
+                f"Backend enabled: {self.config.backend_enabled}",
+                f"Dry run: {dry_run}",
+                f"Backend queue file: {self.config.backend_queue_file}",
                 f"Target FPS: {self.config.target_fps}",
                 f"Max seconds: {self.config.max_seconds}",
                 f"Track IoU threshold: {self.config.track_iou_threshold}",
@@ -1583,6 +1669,25 @@ class ANPRProcessor:
 
             metrics.source_completed = True
             self._finalize_stop_reason(metrics)
+
+            if (
+                not dry_run
+                and self.config.backend_enabled
+                and self._backend_client is not None
+                and self.config.source in {"image", "video"}
+            ):
+                flush_result = self._backend_client.flush_queue()
+                metrics.backend_jobs_succeeded += flush_result.succeeded
+                metrics.backend_jobs_failed += flush_result.failed
+                metrics.backend_jobs_exhausted += flush_result.exhausted
+                metrics.log_lines.append(
+                    "Backend queue flush: "
+                    f"processed={flush_result.processed} "
+                    f"succeeded={flush_result.succeeded} "
+                    f"failed={flush_result.failed} "
+                    f"exhausted={flush_result.exhausted} "
+                    f"pending={flush_result.pending}"
+                )
         except SourceRuntimeError as exc:
             metrics.runtime_error = exc.message
             metrics.stop_reason = "runtime_error"
@@ -1626,6 +1731,10 @@ class ANPRProcessor:
                 f"Evidence files saved: {metrics.evidence_files_saved}",
                 f"Evidence save failures: {metrics.evidence_save_failures}",
                 f"Duplicate events suppressed: {metrics.duplicate_events_suppressed}",
+                f"Backend jobs queued: {metrics.backend_jobs_queued}",
+                f"Backend jobs succeeded: {metrics.backend_jobs_succeeded}",
+                f"Backend jobs failed: {metrics.backend_jobs_failed}",
+                f"Backend jobs exhausted: {metrics.backend_jobs_exhausted}",
                 f"Source completed: {metrics.source_completed}",
                 f"Stop reason: {metrics.stop_reason}",
             ]
@@ -1635,7 +1744,7 @@ class ANPRProcessor:
         metrics.log_lines.extend(
             [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
-                f"M6 dry-run {status}.",
+                f"{'M6 dry-run' if dry_run else 'M7 run'} {status}.",
             ]
         )
 

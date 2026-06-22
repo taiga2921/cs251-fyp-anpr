@@ -191,6 +191,7 @@ class Config:
     backend_token_cache: str = ".cache/backend_token.json"
     backend_queue_file: str = ".cache/backend_queue.jsonl"
     backend_retry_limit: int = 3
+    backend_timeout_seconds: float = 10.0
 
     evidence_mode: str = "metadata"
     runs_dir: str = "runs"
@@ -238,6 +239,7 @@ class Config:
             backend_token_cache=parse_path(env.get("ANPR_BACKEND_TOKEN_CACHE"), ".cache/backend_token.json"),
             backend_queue_file=parse_path(env.get("ANPR_BACKEND_QUEUE_FILE"), ".cache/backend_queue.jsonl"),
             backend_retry_limit=parse_int(env.get("ANPR_BACKEND_RETRY_LIMIT"), 3),
+            backend_timeout_seconds=parse_float(env.get("ANPR_BACKEND_TIMEOUT_SECONDS"), 10.0),
             evidence_mode=parse_str(env.get("ANPR_EVIDENCE_MODE"), "metadata"),
             runs_dir=parse_path(env.get("ANPR_RUNS_DIR"), "runs"),
             save_local_evidence=parse_bool(env.get("ANPR_SAVE_LOCAL_EVIDENCE"), True),
@@ -498,6 +500,17 @@ def _validate_backend(config: Config, result: ValidationResult) -> None:
         result.add_error(
             f"ANPR_BACKEND_RETRY_LIMIT must be >= 0; got {config.backend_retry_limit}."
         )
+    else:
+        result.add_info(f"OK: backend retry limit configured: {config.backend_retry_limit}")
+
+    if config.backend_timeout_seconds <= 0:
+        result.add_error(
+            f"ANPR_BACKEND_TIMEOUT_SECONDS must be > 0; got {config.backend_timeout_seconds}."
+        )
+    else:
+        result.add_info(
+            f"OK: backend timeout seconds configured: {config.backend_timeout_seconds}"
+        )
 
 
 def _validate_output(config: Config, result: ValidationResult) -> None:
@@ -508,6 +521,10 @@ def _validate_output(config: Config, result: ValidationResult) -> None:
         )
     else:
         result.add_info(f"OK: evidence mode configured: {config.evidence_mode}")
+        if config.evidence_mode == "upload":
+            result.add_warning(
+                "ANPR_EVIDENCE_MODE=upload is not supported in M7; use metadata mode."
+            )
 
 
 def validate_config(config: Config, *, strict: bool = False) -> ValidationResult:

@@ -1,6 +1,6 @@
 # AI ANPR v1
 
-**Current milestone:** M6 — Final Event and Evidence Architecture
+**Current milestone:** M7 — Backend Client and Queue Architecture
 
 Python ANPR runtime for vehicle and license plate processing.
 
@@ -18,25 +18,6 @@ Create and activate a virtual environment:
 py -3.12 -m venv .venv
 .\.venv\Scripts\activate
 python -m pip install --upgrade pip setuptools wheel
-```
-
-Install dependencies:
-
-```powershell
-pip install -r requirements.txt
-```
-
-Verify PyTorch and Ultralytics:
-
-```powershell
-python -c "import torch; print(torch.__version__); print(torch.rand(1))"
-python -c "from ultralytics import YOLO; print('ultralytics ok')"
-```
-
-If CPU-only PyTorch on Windows fails during normal install, use the official CPU wheel first, then install the remaining dependencies:
-
-```powershell
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 ```
 
@@ -46,17 +27,15 @@ Use a clean virtual environment and avoid unsupported Python/package combination
 
 Place local YOLO `.pt` files before running detection. Model files are not committed to Git.
 
-M4+ uses **PaddleOCR 2.x legacy API** (`paddleocr<3` in `requirements.txt`).
-
-Configure models, OCR, tracking, and events in `.env`:
+Configure models, OCR, tracking, events, and backend in `.env`:
 
 ```env
 ANPR_VEHICLE_MODEL=models/vehicle/yolo11s.pt
 ANPR_PLATE_MODEL=models/plate/license-plate-finetune-v1s.pt
-ANPR_DEVICE=cpu
-ANPR_OCR_ENGINE=paddleocr
-ANPR_MIN_OCR_CONFIDENCE=0.30
-ANPR_TRACK_IOU_THRESHOLD=0.3
+ANPR_BACKEND_ENABLED=false
+ANPR_BACKEND_BASE_URL=http://localhost:8000/api
+ANPR_BACKEND_CAMERA_ID=
+ANPR_EVIDENCE_MODE=metadata
 ANPR_DUPLICATE_COOLDOWN_SECONDS=10
 ```
 
@@ -69,17 +48,17 @@ python main.py check-config
 
 python main.py run --source image --image samples/images/photo_6177158287829176211_w.jpg --dry-run --strict
 python main.py run --source video --video samples/videos/document_6177158287369184218.mp4 --dry-run --strict
-python main.py run --source rtsp --dry-run --strict
 
+python main.py run --source image --image samples/images/photo_6177158287829176211_w.jpg --strict
 python main.py flush-backend-queue
 ```
 
-`run --dry-run` performs the full M5 pipeline plus local event finalization and evidence saving. Backend posting is not part of M6.
+`--dry-run` performs local event/evidence output only (no backend side effects). Non-dry-run requires `ANPR_BACKEND_ENABLED=true`, enqueues backend jobs, and flushes the queue after finite image/video sources. Use `flush-backend-queue` for pending jobs.
 
 ## Output
 
-Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.json`, `events.jsonl`, and `evidence/` (`full/`, `plate/`, `annotated/`).
+Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.json`, `events.jsonl`, and `evidence/`. Backend queue state is stored in `.cache/backend_queue.jsonl`.
 
 ## Documentation
 
-Full M6 architecture: [docs/m6-final-event-and-evidence-architecture.md](docs/m6-final-event-and-evidence-architecture.md)
+Full M7 architecture: [docs/m7-backend-client-and-queue-architecture.md](docs/m7-backend-client-and-queue-architecture.md)
