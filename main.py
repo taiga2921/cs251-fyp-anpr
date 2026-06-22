@@ -13,7 +13,7 @@ from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-anpr",
-        description="AI ANPR CLI — M7 backend client and queue architecture",
+        description="AI ANPR CLI — M8 backend ANPR data alignment",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

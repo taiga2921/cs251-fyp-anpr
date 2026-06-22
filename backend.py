@@ -1,4 +1,4 @@
-"""Backend client, token cache, and queue for M7."""
+"""Backend client, token cache, and queue for M8."""
 
 from __future__ import annotations
 
@@ -15,11 +15,39 @@ from urllib import error, request
 from config import Config, UPLOAD_MODE_ERROR
 
 TOKEN_EXPIRY_BUFFER_SECONDS = 60
-QUEUE_STATUSES_RETRYABLE = frozenset({"pending", "failed"})
 QUEUE_STATUSES_SKIP = frozenset({"succeeded", "exhausted", "validation_failed"})
 EVIDENCE_IMAGE_TYPES = ("full", "plate", "annotated")
-IMAGE_STATUSES_FINAL = frozenset({"succeeded", "skipped", "validation_failed"})
-IMAGE_STATUSES_RETRYABLE = frozenset({"pending", "failed"})
+EVENT_LOG_STAGES = ("ai_event_created", "ai_images_registered", "ai_job_succeeded")
+STATUS_FINAL = frozenset({"succeeded", "skipped", "validation_failed"})
+STATUS_RETRYABLE = frozenset({"pending", "failed"})
+MAX_PLATE_NUMBER_LENGTH = 20
+MAX_FILE_PATH_LENGTH = 255
+
+
+class BackendApiError(RuntimeError):
+    """Structured backend HTTP or network error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        path: str = "",
+        errors: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.path = path
+        self.message = message
+        self.errors = errors
+
+    def is_validation_failure(self) -> bool:
+        return self.status_code in {404, 422}
+
+    def is_retryable(self) -> bool:
+        if self.status_code is None:
+            return True
+        return self.status_code >= 500
 
 
 @dataclass
@@ -39,12 +67,14 @@ class BackendQueueJob:
     max_attempts: int
     backend_event_id: str | None
     images_sent: int
+    logs_sent: int
     last_error: str | None
     created_at: str
     updated_at: str
     event: dict[str, Any]
     evidence: dict[str, str | None]
     image_statuses: dict[str, str] = field(default_factory=dict)
+    log_statuses: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,12 +86,14 @@ class BackendQueueJob:
             "max_attempts": self.max_attempts,
             "backend_event_id": self.backend_event_id,
             "images_sent": self.images_sent,
+            "logs_sent": self.logs_sent,
             "last_error": self.last_error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "event": self.event,
             "evidence": self.evidence,
             "image_statuses": self.image_statuses,
+            "log_statuses": self.log_statuses,
         }
 
     @classmethod
@@ -82,6 +114,7 @@ class BackendQueueJob:
             max_attempts = 4
 
         image_statuses = dict(payload.get("image_statuses", {}))
+        log_statuses = dict(payload.get("log_statuses", {}))
 
         job = cls(
             job_id=str(payload["job_id"]),
@@ -92,14 +125,16 @@ class BackendQueueJob:
             max_attempts=max_attempts,
             backend_event_id=payload.get("backend_event_id"),
             images_sent=int(payload.get("images_sent", 0)),
+            logs_sent=int(payload.get("logs_sent", 0)),
             last_error=payload.get("last_error"),
             created_at=str(payload.get("created_at", _utc_now_iso())),
             updated_at=str(payload.get("updated_at", _utc_now_iso())),
             event=dict(payload.get("event", {})),
             evidence=evidence,
             image_statuses=image_statuses,
+            log_statuses=log_statuses,
         )
-        return _normalize_job_image_statuses(job)
+        return _normalize_job(job)
 
 
 @dataclass
@@ -120,6 +155,8 @@ class FlushQueueResult:
     skipped: int = 0
     pending: int = 0
     malformed: int = 0
+    camera_verified: bool = False
+    logs_sent: int = 0
 
 
 def _utc_now_iso() -> str:
@@ -151,8 +188,41 @@ def _normalize_job_image_statuses(job: BackendQueueJob) -> BackendQueueJob:
     return job
 
 
+def _normalize_job_log_statuses(job: BackendQueueJob) -> BackendQueueJob:
+    if not job.log_statuses:
+        for stage in EVENT_LOG_STAGES:
+            job.log_statuses[stage] = "pending"
+    return job
+
+
+def _normalize_job(job: BackendQueueJob) -> BackendQueueJob:
+    return _normalize_job_log_statuses(_normalize_job_image_statuses(job))
+
+
 def _count_succeeded_images(job: BackendQueueJob) -> int:
     return sum(1 for status in job.image_statuses.values() if status == "succeeded")
+
+
+def _count_succeeded_logs(job: BackendQueueJob) -> int:
+    return sum(1 for status in job.log_statuses.values() if status == "succeeded")
+
+
+def _normalize_evidence_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    normalized = path.replace("\\", "/").lstrip("./")
+    return normalized[:MAX_FILE_PATH_LENGTH]
+
+
+def _sanitize_plate_number(plate_number: str) -> str:
+    plate = plate_number.strip().upper()
+    if not plate:
+        raise BackendApiError(
+            "plate_number is required for backend posting.",
+            status_code=422,
+            path="/anpr-events",
+        )
+    return plate[:MAX_PLATE_NUMBER_LENGTH]
 
 
 def _is_retryable_job(job: BackendQueueJob) -> bool:
@@ -172,6 +242,7 @@ class BackendClient:
         self.queue_file_path = Path(config.backend_queue_file)
         self.bad_queue_path = self.queue_file_path.parent / "backend_queue.bad.jsonl"
         self.base_url = config.backend_base_url.rstrip("/")
+        self._camera_verified_for_flush = False
 
     def _ensure_parent_dirs(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,7 +291,10 @@ class BackendClient:
 
     def login(self) -> BackendToken:
         if not self.config.backend_email or not self.config.backend_password:
-            raise RuntimeError("Backend email and password are required for login.")
+            raise BackendApiError(
+                "Backend email and password are required for login.",
+                path="/auth/login",
+            )
 
         response = self._request(
             "POST",
@@ -235,7 +309,10 @@ class BackendClient:
         )
         data = response.get("data")
         if not isinstance(data, dict) or not data.get("access_token"):
-            raise RuntimeError("Login response did not include access_token.")
+            raise BackendApiError(
+                "Login response did not include access_token.",
+                path="/auth/login",
+            )
 
         expires_in = int(data.get("expires_in", 3600))
         expires_at = (
@@ -288,7 +365,10 @@ class BackendClient:
                     return {}
                 parsed = json.loads(raw)
                 if not isinstance(parsed, dict):
-                    raise RuntimeError(f"Unexpected non-object response from {path}.")
+                    raise BackendApiError(
+                        f"Unexpected non-object response from {path}.",
+                        path=path,
+                    )
                 return parsed
         except error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
@@ -314,20 +394,62 @@ class BackendClient:
                 )
 
             message = str(parsed.get("message") or exc.reason or "HTTP error")
-            raise RuntimeError(f"HTTP {exc.code} for {path}: {message}") from exc
+            errors: dict[str, Any] | None = None
+            data = parsed.get("data")
+            if isinstance(data, dict) and isinstance(data.get("errors"), dict):
+                errors = data["errors"]
+            raise BackendApiError(
+                f"HTTP {exc.code} for {path}: {message}",
+                status_code=exc.code,
+                path=path,
+                errors=errors,
+            ) from exc
         except error.URLError as exc:
-            raise RuntimeError(f"Network error for {path}: {exc.reason}") from exc
+            raise BackendApiError(
+                f"Network error for {path}: {exc.reason}",
+                path=path,
+            ) from exc
+
+    def verify_camera_mapping(self) -> None:
+        """Confirm configured camera UUID exists in Laravel."""
+        if self._camera_verified_for_flush:
+            return
+
+        if not self.config.backend_camera_id:
+            raise BackendApiError(
+                "ANPR_BACKEND_CAMERA_ID is required for backend posting.",
+                status_code=422,
+                path="/cameras",
+            )
+
+        path = f"/cameras/{self.config.backend_camera_id}"
+        response = self._request("GET", path, None, headers={})
+        data = response.get("data")
+        if isinstance(data, dict) and str(data.get("id")) == self.config.backend_camera_id:
+            self._camera_verified_for_flush = True
+            return
+
+        raise BackendApiError(
+            f"Camera {self.config.backend_camera_id} was not found in backend.",
+            status_code=404,
+            path=path,
+        )
 
     def build_event_payload(self, finalized_event: dict[str, Any]) -> dict[str, Any]:
         if not self.config.backend_camera_id:
-            raise RuntimeError("ANPR_BACKEND_CAMERA_ID is required for backend posting.")
+            raise BackendApiError(
+                "ANPR_BACKEND_CAMERA_ID is required for backend posting.",
+                status_code=422,
+                path="/anpr-events",
+            )
 
         confidence = float(finalized_event.get("confidence", 0.0))
         confidence = max(0.0, min(1.0, confidence))
+        plate_number = _sanitize_plate_number(str(finalized_event.get("plate_number", "")))
 
         return {
             "camera_id": self.config.backend_camera_id,
-            "plate_number": str(finalized_event.get("plate_number", "")),
+            "plate_number": plate_number,
             "confidence": round(confidence, 4),
             "detection_time": _detection_time_from_event(finalized_event),
             "is_valid": True,
@@ -395,8 +517,8 @@ class BackendClient:
     def enqueue_event(self, finalized_event: dict[str, Any]) -> BackendQueueResult:
         try:
             event_payload = self.build_event_payload(finalized_event)
-        except RuntimeError as exc:
-            return BackendQueueResult(success=False, message=str(exc))
+        except BackendApiError as exc:
+            return BackendQueueResult(success=False, message=exc.message)
 
         now = _utc_now_iso()
         retry_limit = self.config.backend_retry_limit
@@ -409,6 +531,7 @@ class BackendClient:
             max_attempts=retry_limit + 1,
             backend_event_id=None,
             images_sent=0,
+            logs_sent=0,
             last_error=None,
             created_at=now,
             updated_at=now,
@@ -418,7 +541,7 @@ class BackendClient:
                 for key in EVIDENCE_IMAGE_TYPES
             },
         )
-        _normalize_job_image_statuses(job)
+        _normalize_job(job)
         jobs, _ = self.read_queue()
         jobs.append(job)
         self.write_queue(jobs)
@@ -432,7 +555,38 @@ class BackendClient:
         data = response.get("data")
         if isinstance(data, dict) and data.get("id"):
             return str(data["id"])
-        raise RuntimeError("Event creation response did not include data.id.")
+        raise BackendApiError(
+            "Event creation response did not include data.id.",
+            path="/anpr-events",
+        )
+
+    def _log_message(self, job: BackendQueueJob, *, stage: str) -> str:
+        payload: dict[str, Any] = {
+            "job_id": job.job_id,
+            "local_event_id": job.local_event_id,
+            "plate_number": job.event.get("plate_number"),
+        }
+        if stage == "ai_images_registered":
+            payload["images_sent"] = _count_succeeded_images(job)
+            payload["image_statuses"] = dict(job.image_statuses)
+        if stage == "ai_job_succeeded":
+            payload["images_sent"] = _count_succeeded_images(job)
+            payload["logs_sent"] = _count_succeeded_logs(job)
+            payload["image_statuses"] = dict(job.image_statuses)
+            payload["log_statuses"] = dict(job.log_statuses)
+        return json.dumps(payload, separators=(",", ":"))
+
+    def _post_event_log(self, backend_event_id: str, stage: str, message: str) -> None:
+        self._request(
+            "POST",
+            "/anpr-event-logs",
+            {
+                "anpr_event_id": backend_event_id,
+                "stage": stage,
+                "message": message,
+            },
+            headers={},
+        )
 
     def _image_resolution(self, path: str | None) -> str | None:
         if not path:
@@ -466,21 +620,54 @@ class BackendClient:
         payload = {
             "anpr_event_id": backend_event_id,
             "image_type": image_type,
-            "file_path": file_path,
+            "file_path": _normalize_evidence_path(file_path),
             "file_size": self._image_file_size(file_path),
             "resolution": self._image_resolution(file_path),
             "expires_at": None,
         }
         self._request("POST", "/anpr-images", payload, headers={})
 
-    def _ensure_upload_mode_supported(self) -> None:
-        if self.config.backend_enabled and self.config.evidence_mode == "upload":
-            raise RuntimeError(UPLOAD_MODE_ERROR)
+    def _apply_api_failure_to_job(
+        self,
+        job: BackendQueueJob,
+        *,
+        bucket: dict[str, str],
+        key: str,
+        exc: BackendApiError,
+    ) -> None:
+        if exc.is_validation_failure():
+            bucket[key] = "validation_failed"
+        else:
+            bucket[key] = "failed"
+        raise exc
+
+    def _send_stage_log_if_pending(
+        self,
+        job: BackendQueueJob,
+        backend_event_id: str,
+        stage: str,
+    ) -> None:
+        status = job.log_statuses.get(stage)
+        if status in STATUS_FINAL:
+            return
+
+        try:
+            self._post_event_log(
+                backend_event_id,
+                stage,
+                self._log_message(job, stage=stage),
+            )
+        except BackendApiError as exc:
+            self._apply_api_failure_to_job(
+                job, bucket=job.log_statuses, key=stage, exc=exc
+            )
+
+        job.log_statuses[stage] = "succeeded"
 
     def _send_pending_image_metadata(self, job: BackendQueueJob, backend_event_id: str) -> None:
         for image_type in EVIDENCE_IMAGE_TYPES:
             status = job.image_statuses.get(image_type)
-            if status in IMAGE_STATUSES_FINAL:
+            if status in STATUS_FINAL:
                 continue
 
             file_path = job.evidence.get(image_type)
@@ -490,13 +677,10 @@ class BackendClient:
 
             try:
                 self._post_image_metadata(job, backend_event_id, image_type, file_path)
-            except RuntimeError as exc:
-                message = str(exc)
-                if "HTTP 422" in message or "Validation failed" in message:
-                    job.image_statuses[image_type] = "validation_failed"
-                    raise RuntimeError(message) from exc
-                job.image_statuses[image_type] = "failed"
-                raise
+            except BackendApiError as exc:
+                self._apply_api_failure_to_job(
+                    job, bucket=job.image_statuses, key=image_type, exc=exc
+                )
 
             job.image_statuses[image_type] = "succeeded"
 
@@ -504,10 +688,46 @@ class BackendClient:
         pending: list[str] = []
         for image_type in EVIDENCE_IMAGE_TYPES:
             status = job.image_statuses.get(image_type)
-            if status in IMAGE_STATUSES_RETRYABLE or status is None:
+            if status in STATUS_RETRYABLE or status is None:
                 if job.evidence.get(image_type):
                     pending.append(image_type)
         return pending
+
+    def _pending_log_stages(self, job: BackendQueueJob) -> list[str]:
+        pending: list[str] = []
+        for stage in EVENT_LOG_STAGES:
+            status = job.log_statuses.get(stage)
+            if status in STATUS_RETRYABLE or status is None:
+                pending.append(stage)
+        return pending
+
+    def _ensure_upload_mode_supported(self) -> None:
+        if self.config.backend_enabled and self.config.evidence_mode == "upload":
+            raise BackendApiError(UPLOAD_MODE_ERROR, status_code=422, path="/anpr-events")
+
+    def _mark_job_failure(self, job: BackendQueueJob, exc: Exception) -> BackendQueueJob:
+        if isinstance(exc, BackendApiError):
+            message = exc.message
+        else:
+            message = str(exc)
+
+        job.last_error = message
+        job.updated_at = _utc_now_iso()
+        job.images_sent = _count_succeeded_images(job)
+        job.logs_sent = _count_succeeded_logs(job)
+
+        if message == UPLOAD_MODE_ERROR or (
+            isinstance(exc, BackendApiError) and exc.is_validation_failure()
+        ):
+            job.status = "validation_failed"
+            return job
+
+        job.attempts += 1
+        if job.attempts >= job.max_attempts:
+            job.status = "exhausted"
+        else:
+            job.status = "failed"
+        return job
 
     def _process_job(
         self,
@@ -515,7 +735,7 @@ class BackendClient:
         all_jobs: list[BackendQueueJob] | None = None,
         job_index: int | None = None,
     ) -> BackendQueueJob:
-        job = _normalize_job_image_statuses(job)
+        job = _normalize_job(job)
         now = _utc_now_iso()
         job.status = "posting"
         job.updated_at = now
@@ -536,39 +756,35 @@ class BackendClient:
                 all_jobs[job_index] = job
                 self._checkpoint_queue(all_jobs)
 
+            self._send_stage_log_if_pending(job, backend_event_id, "ai_event_created")
+
             if self.config.evidence_mode == "metadata":
                 self._send_pending_image_metadata(job, backend_event_id)
                 pending_images = self._pending_image_types(job)
                 if pending_images:
-                    raise RuntimeError(
-                        "Image metadata incomplete for: " + ", ".join(pending_images)
+                    raise BackendApiError(
+                        "Image metadata incomplete for: " + ", ".join(pending_images),
+                        path="/anpr-images",
                     )
 
+            self._send_stage_log_if_pending(job, backend_event_id, "ai_images_registered")
+            self._send_stage_log_if_pending(job, backend_event_id, "ai_job_succeeded")
+
+            pending_logs = self._pending_log_stages(job)
+            if pending_logs:
+                raise BackendApiError(
+                    "Event logs incomplete for: " + ", ".join(pending_logs),
+                    path="/anpr-event-logs",
+                )
+
             job.images_sent = _count_succeeded_images(job)
+            job.logs_sent = _count_succeeded_logs(job)
             job.status = "succeeded"
             job.last_error = None
             job.updated_at = _utc_now_iso()
             return job
-        except RuntimeError as exc:
-            message = str(exc)
-            job.last_error = message
-            job.updated_at = _utc_now_iso()
-            job.images_sent = _count_succeeded_images(job)
-
-            if message == UPLOAD_MODE_ERROR:
-                job.status = "validation_failed"
-                return job
-
-            if "HTTP 422" in message or "Validation failed" in message:
-                job.status = "validation_failed"
-                return job
-
-            job.attempts += 1
-            if job.attempts >= job.max_attempts:
-                job.status = "exhausted"
-            else:
-                job.status = "failed"
-            return job
+        except (BackendApiError, RuntimeError) as exc:
+            return self._mark_job_failure(job, exc)
 
     def flush_queue(self) -> FlushQueueResult:
         if not self.config.backend_enabled:
@@ -578,10 +794,12 @@ class BackendClient:
                 processed=0,
             )
 
+        self._camera_verified_for_flush = False
+
         try:
             self._ensure_upload_mode_supported()
-        except RuntimeError as exc:
-            return FlushQueueResult(success=False, message=str(exc))
+        except BackendApiError as exc:
+            return FlushQueueResult(success=False, message=exc.message)
 
         jobs, malformed = self.read_queue()
         if malformed:
@@ -604,11 +822,35 @@ class BackendClient:
                 malformed=malformed,
             )
 
+        camera_verified = False
+        try:
+            self.verify_camera_mapping()
+            camera_verified = True
+        except BackendApiError as exc:
+            if exc.is_validation_failure():
+                for index, job in enumerate(jobs):
+                    if not _is_retryable_job(job):
+                        continue
+                    jobs[index] = _normalize_job(job)
+                    jobs[index].status = "validation_failed"
+                    jobs[index].last_error = exc.message
+                    jobs[index].updated_at = _utc_now_iso()
+                self._checkpoint_queue(jobs)
+                return FlushQueueResult(
+                    success=True,
+                    message="Backend camera mapping validation failed.",
+                    skipped=len(jobs),
+                    malformed=malformed,
+                    camera_verified=False,
+                )
+            return FlushQueueResult(success=False, message=exc.message, malformed=malformed)
+
         processed = 0
         succeeded = 0
         failed = 0
         exhausted = 0
         skipped = 0
+        logs_sent = 0
 
         for index, job in enumerate(jobs):
             if job.status in QUEUE_STATUSES_SKIP:
@@ -631,9 +873,11 @@ class BackendClient:
                 jobs[index] = job
                 continue
 
+            before_logs = job.logs_sent
             processed += 1
             jobs[index] = self._process_job(jobs[index], jobs, index)
             job = jobs[index]
+            logs_sent += max(0, job.logs_sent - before_logs)
 
             if job.status == "succeeded":
                 succeeded += 1
@@ -657,6 +901,8 @@ class BackendClient:
             skipped=skipped,
             pending=pending,
             malformed=malformed,
+            camera_verified=camera_verified,
+            logs_sent=logs_sent,
         )
 
     def job_results_for_local_events(
@@ -674,6 +920,9 @@ class BackendClient:
                 "status": job.status,
                 "backend_event_id": job.backend_event_id,
                 "images_sent": job.images_sent,
+                "logs_sent": job.logs_sent,
+                "image_statuses": dict(job.image_statuses),
+                "log_statuses": dict(job.log_statuses),
                 "last_error": job.last_error,
             }
         return results

@@ -1,4 +1,4 @@
-"""ANPR runtime with M7 backend client and queue architecture."""
+"""ANPR runtime with M8 backend data alignment."""
 
 from __future__ import annotations
 
@@ -204,6 +204,8 @@ class RuntimeMetrics:
     backend_jobs_succeeded: int = 0
     backend_jobs_failed: int = 0
     backend_jobs_exhausted: int = 0
+    backend_logs_sent: int = 0
+    backend_camera_verified: bool = False
 
 
 @dataclass
@@ -973,6 +975,8 @@ class ANPRProcessor:
                 "exhausted": flush_result.exhausted,
                 "pending": flush_result.pending,
                 "malformed": flush_result.malformed,
+                "camera_verified": flush_result.camera_verified,
+                "logs_sent": flush_result.logs_sent,
             },
             "events": results,
         }
@@ -1432,7 +1436,7 @@ class ANPRProcessor:
         ]
         summary: dict = {
             "status": status,
-            "milestone": "M7",
+            "milestone": "M8",
             "source_type": self.config.source,
             "source_path": self._safe_source_path(),
             "frames_read": metrics.frames_read,
@@ -1448,6 +1452,8 @@ class ANPRProcessor:
             "backend_jobs_succeeded": metrics.backend_jobs_succeeded,
             "backend_jobs_failed": metrics.backend_jobs_failed,
             "backend_jobs_exhausted": metrics.backend_jobs_exhausted,
+            "backend_logs_sent": metrics.backend_logs_sent,
+            "backend_camera_verified": metrics.backend_camera_verified,
             "backend_queue_file": self.config.backend_queue_file,
             "validation_mode": "strict" if strict else "standard",
             "warnings": warnings,
@@ -1598,7 +1604,7 @@ class ANPRProcessor:
 
         metrics.log_lines.extend(
             [
-                f"{'M6 dry-run' if dry_run else 'M7 run'} started.",
+                f"{'M6 dry-run' if dry_run else 'M8 run'} started.",
                 f"Source type: {self.config.source}",
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
@@ -1704,6 +1710,8 @@ class ANPRProcessor:
                 metrics.backend_jobs_succeeded += flush_result.succeeded
                 metrics.backend_jobs_failed += flush_result.failed
                 metrics.backend_jobs_exhausted += flush_result.exhausted
+                metrics.backend_logs_sent += flush_result.logs_sent
+                metrics.backend_camera_verified = flush_result.camera_verified
                 metrics.log_lines.append(
                     "Backend queue flush: "
                     f"processed={flush_result.processed} "
@@ -1711,7 +1719,9 @@ class ANPRProcessor:
                     f"failed={flush_result.failed} "
                     f"exhausted={flush_result.exhausted} "
                     f"pending={flush_result.pending} "
-                    f"malformed={flush_result.malformed}"
+                    f"malformed={flush_result.malformed} "
+                    f"logs_sent={flush_result.logs_sent} "
+                    f"camera_verified={flush_result.camera_verified}"
                 )
                 self._write_backend_results(run_dir, flush_result)
                 metrics.log_lines.append(f"Backend results written: {run_dir / 'backend_results.json'}")
@@ -1762,6 +1772,8 @@ class ANPRProcessor:
                 f"Backend jobs succeeded: {metrics.backend_jobs_succeeded}",
                 f"Backend jobs failed: {metrics.backend_jobs_failed}",
                 f"Backend jobs exhausted: {metrics.backend_jobs_exhausted}",
+                f"Backend logs sent: {metrics.backend_logs_sent}",
+                f"Backend camera verified: {metrics.backend_camera_verified}",
                 f"Source completed: {metrics.source_completed}",
                 f"Stop reason: {metrics.stop_reason}",
             ]
@@ -1771,7 +1783,7 @@ class ANPRProcessor:
         metrics.log_lines.extend(
             [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
-                f"{'M6 dry-run' if dry_run else 'M7 run'} {status}.",
+                f"{'M6 dry-run' if dry_run else 'M8 run'} {status}.",
             ]
         )
 

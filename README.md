@@ -1,6 +1,6 @@
 # AI ANPR v1
 
-**Current milestone:** M7 — Backend Client and Queue Architecture
+**Current milestone:** M8 — Backend ANPR Data Architecture Alignment
 
 Python ANPR runtime for vehicle and license plate processing.
 
@@ -53,12 +53,12 @@ python main.py run --source image --image samples/images/photo_61771582878291762
 python main.py flush-backend-queue
 ```
 
-`--dry-run` performs local event/evidence output only (no backend side effects). Non-dry-run requires `ANPR_BACKEND_ENABLED=true`, enqueues backend jobs, and flushes the queue after finite image/video sources. Use `flush-backend-queue` for pending jobs.
+`--dry-run` performs local event/evidence output only (no backend side effects). Non-dry-run requires `ANPR_BACKEND_ENABLED=true`, enqueues backend jobs, and flushes the queue after finite image/video sources. M8 aligns posted ANPR events, image metadata, and event logs with the Laravel backend.
 
 ## Output
 
-Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.json`, `events.jsonl`, `evidence/`, and (after backend flush) `backend_results.json`. Backend queue state is stored in `.cache/backend_queue.jsonl`. `ANPR_BACKEND_RETRY_LIMIT` is the number of retries after the first attempt (0 = one try only).
+Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.json`, `events.jsonl`, `evidence/`, and (after backend flush) `backend_results.json`. Backend queue state is stored in `.cache/backend_queue.jsonl`.
 
 ## Documentation
 
-Full M7 architecture: [docs/m7-backend-client-and-queue-architecture.md](docs/m7-backend-client-and-queue-architecture.md)
+Full M8 architecture: [docs/m8-backend-anpr-data-architecture-alignment.md](docs/m8-backend-anpr-data-architecture-alignment.md)
