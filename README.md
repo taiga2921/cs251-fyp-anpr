@@ -1,8 +1,12 @@
 # AI ANPR v1
 
-**Current milestone:** M9 — Evidence Delivery Architecture
+**Current milestone:** M10 — Frontend ANPR Feature Architecture
 
 Python ANPR runtime for vehicle and license plate processing.
+
+Frontend monitoring is implemented in the React frontend under `src/feature/anpr-monitoring/`.
+
+Full M10 architecture: [docs/m10-frontend-anpr-feature-architecture.md](docs/m10-frontend-anpr-feature-architecture.md)
 
 ## Environment Setup
 
