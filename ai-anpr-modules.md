@@ -1183,6 +1183,8 @@ Initial acceptable targets:
 | Backend posting | Async, should not block runtime |
 | Model loading | Once at startup |
 
+**M15:** `worker_summary.json` records `processed_fps`, `tuning_profile`, `performance_target_results`, OCR throttle metrics, and deployment profiles (demo / CPU / GPU). See [docs/m15-performance-and-accuracy-tuning-architecture.md](docs/m15-performance-and-accuracy-tuning-architecture.md).
+
 ---
 
 ## 16. What Not To Build Initially

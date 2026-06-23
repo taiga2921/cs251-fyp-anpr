@@ -209,6 +209,7 @@ class Config:
     ocr_lang: str = "en"
     ocr_preprocess: bool = True
     ocr_scale: float = 2.0
+    ocr_min_interval_seconds: float = 0.35
 
     backend_enabled: bool = False
     backend_base_url: str = "http://localhost:8000/api"
@@ -267,6 +268,9 @@ class Config:
             ocr_lang=parse_str(env.get("ANPR_OCR_LANG"), "en"),
             ocr_preprocess=parse_bool(env.get("ANPR_OCR_PREPROCESS"), True),
             ocr_scale=parse_float(env.get("ANPR_OCR_SCALE"), 2.0),
+            ocr_min_interval_seconds=parse_float(
+                env.get("ANPR_OCR_MIN_INTERVAL_SECONDS"), 0.35
+            ),
             backend_enabled=parse_bool(env.get("ANPR_BACKEND_ENABLED"), False),
             backend_base_url=parse_str(env.get("ANPR_BACKEND_BASE_URL"), "http://localhost:8000/api"),
             backend_email=parse_optional_str(env.get("ANPR_BACKEND_EMAIL")),
@@ -554,6 +558,19 @@ def _validate_ocr(config: Config, result: ValidationResult, strict: bool) -> Non
         result.add_error(f"ANPR_OCR_SCALE must be > 0; got {config.ocr_scale}.")
     else:
         result.add_info(f"OK: OCR preprocess scale configured: {config.ocr_scale}")
+
+    if config.ocr_min_interval_seconds < 0:
+        result.add_error(
+            "ANPR_OCR_MIN_INTERVAL_SECONDS must be >= 0; "
+            f"got {config.ocr_min_interval_seconds}."
+        )
+    elif config.ocr_min_interval_seconds == 0:
+        result.add_info("OK: OCR throttle disabled (ANPR_OCR_MIN_INTERVAL_SECONDS=0)")
+    else:
+        result.add_info(
+            "OK: OCR min interval seconds configured: "
+            f"{config.ocr_min_interval_seconds}"
+        )
 
     if importlib.util.find_spec("paddleocr") is None:
         message = "PaddleOCR package is not installed (pip install -r requirements.txt)."

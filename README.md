@@ -1,6 +1,10 @@
 # AI ANPR v1
 
-**Current milestone:** M14 — Testing Architecture
+**Current milestone:** M15 — Performance and Accuracy Tuning Architecture
+
+M15 tunes runtime FPS, OCR efficiency, event latency metrics, backend list performance, and frontend polling backoff while preserving M12–M14 behavior.
+
+Full M15 architecture: [docs/m15-performance-and-accuracy-tuning-architecture.md](docs/m15-performance-and-accuracy-tuning-architecture.md)
 
 M14 adds regression coverage across the AI runtime, Laravel ANPR APIs, React ANPR UI, and manual end-to-end flows.
 

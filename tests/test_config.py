@@ -140,6 +140,13 @@ class TestConfigValidation:
         assert code == 1
         assert RTSP_URL_CLI_ERROR in capsys.readouterr().out
 
+    def test_validate_config_ocr_min_interval(self, minimal_config, sample_image):
+        minimal_config.image_path = str(sample_image)
+        minimal_config.ocr_min_interval_seconds = -1
+        result = validate_config(minimal_config, strict=False)
+        assert not result.ok
+        assert any("ANPR_OCR_MIN_INTERVAL_SECONDS" in error for error in result.errors)
+
     def test_validate_m11_runtime_intervals(self, minimal_config, sample_image):
         minimal_config.image_path = str(sample_image)
         minimal_config.rtsp_health_log_interval_seconds = 0

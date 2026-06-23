@@ -1,4 +1,4 @@
-"""CLI entry point for AI ANPR (M11)."""
+"""CLI entry point for AI ANPR (M15)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-anpr",
-        description="AI ANPR CLI — M11 realtime RTSP runtime architecture",
+        description="AI ANPR CLI — M15 performance and accuracy tuning architecture",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -29,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run ANPR processing with M11 realtime RTSP runtime",
+        help="Run ANPR processing with M15 performance tuning runtime",
     )
     run_parser.add_argument(
         "--source",
@@ -117,6 +117,13 @@ def _print_run_summary(dry_run) -> None:
     print(f"Events written: {dry_run.summary.get('events_written', 0)}")
     print(f"Evidence files saved: {dry_run.summary.get('evidence_files_saved', 0)}")
     print(f"Duplicate events suppressed: {dry_run.summary.get('duplicate_events_suppressed', 0)}")
+    print(f"Processed FPS: {dry_run.summary.get('processed_fps', 0)}")
+    avg_latency = dry_run.summary.get("average_event_latency_seconds")
+    print(
+        f"Average event latency (s): "
+        f"{avg_latency if avg_latency is not None else 'n/a'}"
+    )
+    print(f"OCR calls skipped by throttle: {dry_run.summary.get('ocr_calls_skipped_by_throttle', 0)}")
     print(f"Backend jobs queued: {dry_run.summary.get('backend_jobs_queued', 0)}")
     print(f"Backend jobs succeeded: {dry_run.summary.get('backend_jobs_succeeded', 0)}")
     print(f"Backend jobs failed: {dry_run.summary.get('backend_jobs_failed', 0)}")

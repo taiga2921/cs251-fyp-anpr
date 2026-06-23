@@ -13,7 +13,9 @@ class TestPlateNormalization:
         [
             ("abc 1234", "ABC1234"),
             ("WXY-5678", "WXY5678"),
+            ("WXY\u20115678", "WXY5678"),
             ("pmk.8811", "PMK8811"),
+            ("PMK\u00b78811", "PMK8811"),
             ("  jke_9900  ", "JKE9900"),
             ("a/b\\c1", "ABC1"),
         ],
