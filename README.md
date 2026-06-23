@@ -1,6 +1,10 @@
 # AI ANPR v1
 
-**Current milestone:** M11 — Realtime RTSP Runtime Architecture
+**Current milestone:** M12 — Live ANPR Monitoring Architecture
+
+M12 connects the M11 RTSP runtime, Laravel ANPR APIs, and React ANPR monitoring page so new detections appear automatically in the frontend. This is live event monitoring, not video livestreaming.
+
+Full M12 architecture: [docs/m12-live-anpr-monitoring-architecture.md](docs/m12-live-anpr-monitoring-architecture.md)
 
 Python ANPR runtime for vehicle and license plate processing.
 
@@ -59,11 +63,3 @@ python main.py flush-backend-queue
 ## Output
 
 Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.json`, `events.jsonl`, `evidence/`, and (after backend flush) `backend_results.json`. Queue state: `.cache/backend_queue.jsonl`.
-
-## Documentation
-
-Full M11 architecture: [docs/m11-realtime-rtsp-runtime-architecture.md](docs/m11-realtime-rtsp-runtime-architecture.md)
-
-M10 frontend ANPR feature: [docs/m10-frontend-anpr-feature-architecture.md](docs/m10-frontend-anpr-feature-architecture.md)
-
-M9 evidence delivery: [docs/m9-evidence-delivery-architecture.md](docs/m9-evidence-delivery-architecture.md)

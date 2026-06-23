@@ -903,8 +903,10 @@ evidence saved
 backend job queued
 runtime continues reading camera
 backend job posts event/images
-frontend shows event
+frontend shows event (M12: React polls Laravel and auto-refreshes with LIVE indicator)
 ```
+
+**M12 note:** M11 handles RTSP runtime stability. M12 handles frontend/backend live event monitoring. Live ANPR monitoring means event auto-refresh, not video streaming. The React frontend polls Laravel ANPR event APIs and shows a LIVE indicator. The AI runtime should continue sending backend events/evidence through the existing queue.
 
 ## 11.2 Sample video flow
 
