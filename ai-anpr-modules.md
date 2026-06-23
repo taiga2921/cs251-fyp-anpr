@@ -910,6 +910,8 @@ frontend shows event (M12: React polls Laravel and auto-refreshes with LIVE indi
 
 **M13 note:** Backend owns vehicle linking and creation after event ingestion. The AI sends plate and detection details only; it must not send or decide `vehicle_id`. Linked vehicle records are a Laravel/frontend architecture layer.
 
+**M14 note:** Regression coverage lives in `docs/m14-testing-architecture.md`. AI tests: `pytest` under `tests/`. Backend: `php artisan test --filter=Anpr`. Frontend: `yarn test` (Vitest).
+
 ## 11.2 Sample video flow
 
 ```text

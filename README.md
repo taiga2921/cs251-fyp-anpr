@@ -1,8 +1,12 @@
 # AI ANPR v1
 
-**Current milestone:** M13 — Linked Vehicle Record Architecture
+**Current milestone:** M14 — Testing Architecture
 
-M13 keeps the AI event payload unchanged. Laravel now links each ANPR event to an existing vehicle record or auto-creates one when the plate is unknown.
+M14 adds regression coverage across the AI runtime, Laravel ANPR APIs, React ANPR UI, and manual end-to-end flows.
+
+Full M14 architecture: [docs/m14-testing-architecture.md](docs/m14-testing-architecture.md)
+
+M13 keeps the AI event payload unchanged. Laravel links each ANPR event to an existing vehicle record or auto-creates one when the plate is unknown.
 
 Full M13 architecture: [docs/m13-linked-vehicle-record-architecture.md](docs/m13-linked-vehicle-record-architecture.md)
 
