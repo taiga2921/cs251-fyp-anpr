@@ -1269,6 +1269,16 @@ class BackendClient:
             images_sent=images_sent,
         )
 
+    def flush_queue_safe(self) -> FlushQueueResult:
+        """Flush the backend queue without raising into the ANPR frame loop."""
+        try:
+            return self.flush_queue()
+        except Exception as exc:
+            return FlushQueueResult(
+                success=False,
+                message=f"Backend queue flush failed: {exc}",
+            )
+
     def job_results_for_local_events(
         self, local_event_ids: set[str]
     ) -> dict[str, dict[str, Any]]:

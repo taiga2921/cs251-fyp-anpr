@@ -153,6 +153,33 @@ def is_plausible_rtsp_url(url: str) -> bool:
     return parsed.scheme in {"rtsp", "rtsps"} and bool(parsed.netloc)
 
 
+def mask_rtsp_url(url: str) -> str:
+    """Return an RTSP URL with credentials redacted for logs and summaries."""
+    if not url or not url.strip():
+        return "rtsp://***"
+
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in {"rtsp", "rtsps"}:
+            return url
+
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+
+        masked = f"{parsed.scheme}://"
+        if parsed.username or parsed.password:
+            masked += "***@"
+        masked += host
+        if parsed.path:
+            masked += parsed.path
+        if parsed.query:
+            masked += f"?{parsed.query}"
+        return masked
+    except Exception:
+        return "rtsp://***"
+
+
 @dataclass
 class Config:
     """Typed ANPR configuration."""
@@ -201,6 +228,14 @@ class Config:
 
     max_seconds: float | None = None
 
+    rtsp_reconnect_enabled: bool = True
+    rtsp_reconnect_max_attempts: int = 0
+    rtsp_reconnect_initial_delay_seconds: float = 2.0
+    rtsp_reconnect_max_delay_seconds: float = 30.0
+    rtsp_read_failure_limit: int = 10
+    rtsp_health_log_interval_seconds: float = 15.0
+    backend_queue_flush_interval_seconds: float = 10.0
+
     @classmethod
     def from_env(cls) -> Config:
         """Load configuration from .env, environment variables, and defaults."""
@@ -246,6 +281,21 @@ class Config:
             save_local_evidence=parse_bool(env.get("ANPR_SAVE_LOCAL_EVIDENCE"), True),
             delete_local_after_upload=parse_bool(env.get("ANPR_DELETE_LOCAL_AFTER_UPLOAD"), False),
             evidence_retention_days=parse_int(env.get("ANPR_EVIDENCE_RETENTION_DAYS"), 0),
+            rtsp_reconnect_enabled=parse_bool(env.get("ANPR_RTSP_RECONNECT_ENABLED"), True),
+            rtsp_reconnect_max_attempts=parse_int(env.get("ANPR_RTSP_RECONNECT_MAX_ATTEMPTS"), 0),
+            rtsp_reconnect_initial_delay_seconds=parse_float(
+                env.get("ANPR_RTSP_RECONNECT_INITIAL_DELAY_SECONDS"), 2.0
+            ),
+            rtsp_reconnect_max_delay_seconds=parse_float(
+                env.get("ANPR_RTSP_RECONNECT_MAX_DELAY_SECONDS"), 30.0
+            ),
+            rtsp_read_failure_limit=parse_int(env.get("ANPR_RTSP_READ_FAILURE_LIMIT"), 10),
+            rtsp_health_log_interval_seconds=parse_float(
+                env.get("ANPR_RTSP_HEALTH_LOG_INTERVAL_SECONDS"), 15.0
+            ),
+            backend_queue_flush_interval_seconds=parse_float(
+                env.get("ANPR_BACKEND_QUEUE_FLUSH_INTERVAL_SECONDS"), 10.0
+            ),
         )
 
     def project_root_path(self) -> Path:
@@ -445,6 +495,52 @@ def _validate_inference(config: Config, result: ValidationResult) -> None:
         result.add_error(f"--max-seconds must be > 0; got {config.max_seconds}.")
 
 
+def _validate_m11_runtime(config: Config, result: ValidationResult) -> None:
+    if config.rtsp_reconnect_initial_delay_seconds <= 0:
+        result.add_error(
+            "ANPR_RTSP_RECONNECT_INITIAL_DELAY_SECONDS must be > 0; "
+            f"got {config.rtsp_reconnect_initial_delay_seconds}."
+        )
+    if config.rtsp_reconnect_max_delay_seconds < config.rtsp_reconnect_initial_delay_seconds:
+        result.add_error(
+            "ANPR_RTSP_RECONNECT_MAX_DELAY_SECONDS must be >= "
+            "ANPR_RTSP_RECONNECT_INITIAL_DELAY_SECONDS."
+        )
+    if config.rtsp_read_failure_limit < 1:
+        result.add_error(
+            f"ANPR_RTSP_READ_FAILURE_LIMIT must be >= 1; got {config.rtsp_read_failure_limit}."
+        )
+    if config.rtsp_health_log_interval_seconds <= 0:
+        result.add_error(
+            "ANPR_RTSP_HEALTH_LOG_INTERVAL_SECONDS must be > 0; "
+            f"got {config.rtsp_health_log_interval_seconds}."
+        )
+    if config.backend_queue_flush_interval_seconds <= 0:
+        result.add_error(
+            "ANPR_BACKEND_QUEUE_FLUSH_INTERVAL_SECONDS must be > 0; "
+            f"got {config.backend_queue_flush_interval_seconds}."
+        )
+    if config.rtsp_reconnect_max_attempts < 0:
+        result.add_error(
+            "ANPR_RTSP_RECONNECT_MAX_ATTEMPTS must be >= 0 (0 = unlimited); "
+            f"got {config.rtsp_reconnect_max_attempts}."
+        )
+
+    if config.source == "rtsp":
+        result.add_info(
+            f"OK: RTSP reconnect enabled={config.rtsp_reconnect_enabled} "
+            f"(max attempts={config.rtsp_reconnect_max_attempts or 'unlimited'})"
+        )
+        result.add_info(
+            f"OK: RTSP health log interval: {config.rtsp_health_log_interval_seconds}s"
+        )
+    if config.backend_enabled:
+        result.add_info(
+            "OK: backend queue flush interval: "
+            f"{config.backend_queue_flush_interval_seconds}s"
+        )
+
+
 def _validate_ocr(config: Config, result: ValidationResult, strict: bool) -> None:
     if config.ocr_engine not in VALID_OCR_ENGINES:
         result.add_error(
@@ -593,6 +689,7 @@ def validate_backend_config(config: Config) -> ValidationResult:
     _validate_backend(config, result)
     _validate_evidence_mode(config, result)
     _validate_evidence_retention(config, result)
+    _validate_m11_runtime(config, result)
     return result
 
 
@@ -614,6 +711,7 @@ def validate_config(config: Config, *, strict: bool = False) -> ValidationResult
     _validate_backend(config, result)
     _validate_evidence_mode(config, result)
     _validate_evidence_retention(config, result)
+    _validate_m11_runtime(config, result)
     return result
 
 

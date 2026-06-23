@@ -1,10 +1,11 @@
-"""ANPR runtime with M9 evidence delivery architecture."""
+"""ANPR runtime with M11 realtime RTSP architecture."""
 
 from __future__ import annotations
 
 import json
 import math
 import re
+import signal
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field, fields
@@ -15,7 +16,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from config import Config, ValidationResult
+from config import Config, ValidationResult, mask_rtsp_url
 from backend import BackendClient, FlushQueueResult
 
 ASSUMED_VIDEO_FPS = 30.0
@@ -208,6 +209,13 @@ class RuntimeMetrics:
     backend_camera_verified: bool = False
     backend_images_sent: int = 0
     local_evidence_deleted: int = 0
+    started_at: str | None = None
+    ended_at: str | None = None
+    last_frame_at: str | None = None
+    rtsp_reconnect_attempts: int = 0
+    rtsp_reconnect_successes: int = 0
+    rtsp_consecutive_read_failures: int = 0
+    active_tracks_finalized_on_shutdown: int = 0
 
 
 @dataclass
@@ -511,6 +519,12 @@ class ANPRProcessor:
         self._plate_last_event_at: dict[str, float] = {}
         self._dry_run: bool = True
         self._backend_client: BackendClient | None = None
+        self._stop_requested: bool = False
+        self._runtime_metrics: RuntimeMetrics | None = None
+        self._last_health_log_at: float | None = None
+        self._last_backend_queue_flush_at: float | None = None
+        self._rtsp_reconnect_delay: float = 2.0
+        self._shutdown_tracks_finalized: bool = False
 
     def _make_run_dir(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -522,9 +536,162 @@ class ANPRProcessor:
         if self.config.source == "webcam":
             return f"webcam index {self.config.camera_index}"
         if self.config.source == "rtsp":
-            return "RTSP stream (ANPR_RTSP_URL)"
+            return f"RTSP stream ({mask_rtsp_url(self.config.rtsp_url)})"
         source_path = self._safe_source_path()
         return source_path or self.config.source
+
+    def request_stop(self, reason: str = "manual_shutdown") -> None:
+        """Request a graceful runtime stop from signal handlers or CLI interrupt."""
+        self._stop_requested = True
+        if reason:
+            self._stop_reason = reason
+
+    def _install_signal_handlers(self) -> None:
+        def _handle_signal(signum: int, _frame: Any) -> None:
+            self.request_stop("manual_shutdown")
+
+        signal.signal(signal.SIGINT, _handle_signal)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _handle_signal)
+
+    def _log_runtime_line(self, message: str) -> None:
+        if self._runtime_metrics is not None:
+            self._runtime_metrics.log_lines.append(message)
+
+    def _maybe_log_health(self, metrics: RuntimeMetrics, loop_start_time: float) -> None:
+        if self.config.source not in {"rtsp", "webcam"}:
+            return
+
+        now = time.time()
+        if (
+            self._last_health_log_at is not None
+            and (now - self._last_health_log_at)
+            < self.config.rtsp_health_log_interval_seconds
+        ):
+            return
+
+        self._last_health_log_at = now
+        payload = {
+            "type": "health",
+            "uptime_seconds": round(now - loop_start_time, 3),
+            "source_type": self.config.source,
+            "frames_read": metrics.frames_read,
+            "frames_processed": metrics.frames_processed,
+            "active_tracks": sum(
+                1 for track in self._tracks.values() if not track.finalized
+            ),
+            "events_finalized": metrics.events_finalized,
+            "backend_jobs_queued": metrics.backend_jobs_queued,
+            "backend_jobs_succeeded": metrics.backend_jobs_succeeded,
+            "backend_jobs_failed": metrics.backend_jobs_failed,
+            "backend_jobs_exhausted": metrics.backend_jobs_exhausted,
+            "rtsp_reconnect_attempts": metrics.rtsp_reconnect_attempts,
+            "last_frame_at": metrics.last_frame_at,
+            "stop_reason": self._stop_reason if self._stop_requested else None,
+        }
+        self._log_runtime_line(json.dumps(payload, separators=(",", ":")))
+
+    def _apply_flush_result(
+        self,
+        metrics: RuntimeMetrics,
+        flush_result: FlushQueueResult,
+        run_dir: Path,
+    ) -> None:
+        metrics.backend_jobs_succeeded += flush_result.succeeded
+        metrics.backend_jobs_failed += flush_result.failed
+        metrics.backend_jobs_exhausted += flush_result.exhausted
+        metrics.backend_logs_sent += flush_result.logs_sent
+        metrics.backend_images_sent += flush_result.images_sent
+        metrics.backend_camera_verified = (
+            metrics.backend_camera_verified or flush_result.camera_verified
+        )
+        if not flush_result.success:
+            warning = f"Backend queue flush warning: {flush_result.message}"
+            if warning not in metrics.runtime_warnings:
+                metrics.runtime_warnings.append(warning)
+            self._log_runtime_line(warning)
+            return
+
+        self._log_runtime_line(
+            "Backend queue flush: "
+            f"processed={flush_result.processed} "
+            f"succeeded={flush_result.succeeded} "
+            f"failed={flush_result.failed} "
+            f"exhausted={flush_result.exhausted} "
+            f"pending={flush_result.pending} "
+            f"malformed={flush_result.malformed} "
+            f"images_sent={flush_result.images_sent} "
+            f"logs_sent={flush_result.logs_sent}"
+        )
+        if flush_result.processed > 0 or flush_result.succeeded > 0:
+            self._write_backend_results(run_dir, flush_result)
+
+    def _maybe_flush_backend_queue(
+        self,
+        metrics: RuntimeMetrics,
+        run_dir: Path,
+        *,
+        dry_run: bool,
+    ) -> None:
+        if dry_run or self._backend_client is None:
+            return
+
+        now = time.time()
+        if (
+            self._last_backend_queue_flush_at is not None
+            and (now - self._last_backend_queue_flush_at)
+            < self.config.backend_queue_flush_interval_seconds
+        ):
+            return
+
+        self._last_backend_queue_flush_at = now
+        flush_result = self._backend_client.flush_queue_safe()
+        self._apply_flush_result(metrics, flush_result, run_dir)
+
+    def _attempt_rtsp_reconnect(self, metrics: RuntimeMetrics | None) -> bool:
+        masked_url = mask_rtsp_url(self.config.rtsp_url)
+
+        while not self._stop_requested:
+            if metrics is not None:
+                metrics.rtsp_reconnect_attempts += 1
+                attempt = metrics.rtsp_reconnect_attempts
+            else:
+                attempt = 1
+
+            max_attempts = self.config.rtsp_reconnect_max_attempts
+            if max_attempts > 0 and attempt > max_attempts:
+                self._stop_reason = "rtsp_reconnect_exhausted"
+                self._log_runtime_line(
+                    f"RTSP reconnect exhausted; stopping runtime ({masked_url})"
+                )
+                return False
+
+            delay = self._rtsp_reconnect_delay
+            self._log_runtime_line(
+                f"RTSP reconnect attempt {attempt} after {delay:.1f}s ({masked_url})"
+            )
+            time.sleep(delay)
+            self.close_source()
+
+            capture = cv2.VideoCapture(self.config.rtsp_url)
+            if capture.isOpened():
+                self._capture = capture
+                self._rtsp_reconnect_delay = (
+                    self.config.rtsp_reconnect_initial_delay_seconds
+                )
+                if metrics is not None:
+                    metrics.rtsp_reconnect_successes += 1
+                self._log_runtime_line("RTSP reconnect succeeded")
+                return True
+
+            self._log_runtime_line(f"RTSP reconnect failed ({masked_url})")
+            self._rtsp_reconnect_delay = min(
+                self._rtsp_reconnect_delay * 2,
+                self.config.rtsp_reconnect_max_delay_seconds,
+            )
+
+        self._stop_reason = self._stop_reason or "manual_shutdown"
+        return False
 
     def _safe_source_path(self) -> str | None:
         if self.config.source == "rtsp":
@@ -808,6 +975,8 @@ class ANPRProcessor:
             return self.config.early_finalize_min_votes
         if reason == "source_end" and self.config.source == "image":
             return 1
+        if reason in {"source_end", "manual_shutdown", "runtime_shutdown"}:
+            return self.config.min_plate_votes
         return self.config.min_plate_votes
 
     def finalize_track(
@@ -822,7 +991,7 @@ class ANPRProcessor:
 
         selection = select_best_plate_for_track(track)
         if selection is None:
-            if reason in {"track_expired", "source_end"}:
+            if reason in {"track_expired", "source_end", "manual_shutdown", "runtime_shutdown"}:
                 track.finalized = True
                 track.finalization_reason = reason
                 metrics.track_finalizations_rejected += 1
@@ -831,7 +1000,7 @@ class ANPRProcessor:
         plate_number, confidence, vote_count = selection
         min_votes = self._min_votes_for_finalize(reason)
         if vote_count < min_votes:
-            if reason in {"track_expired", "source_end"}:
+            if reason in {"track_expired", "source_end", "manual_shutdown", "runtime_shutdown"}:
                 track.finalized = True
                 track.finalization_reason = reason
                 metrics.track_finalizations_rejected += 1
@@ -839,7 +1008,7 @@ class ANPRProcessor:
 
         track.decision_finalized = True
         track.finalization_reason = reason
-        if reason in {"track_expired", "source_end"}:
+        if reason in {"track_expired", "source_end", "manual_shutdown", "runtime_shutdown"}:
             track.finalized = True
 
         metrics.tracks_finalized += 1
@@ -848,6 +1017,8 @@ class ANPRProcessor:
         elif reason == "track_expired":
             metrics.tracks_finalized_expired += 1
         elif reason == "source_end":
+            metrics.tracks_finalized_source_end += 1
+        elif reason in {"manual_shutdown", "runtime_shutdown"}:
             metrics.tracks_finalized_source_end += 1
 
         finalized = FinalizedTrackCandidate(
@@ -1154,6 +1325,34 @@ class ANPRProcessor:
                 continue
             self.finalize_track(track, "source_end", metrics)
 
+    def finalize_active_tracks_on_shutdown(
+        self,
+        packet: FramePacket,
+        metrics: RuntimeMetrics,
+    ) -> None:
+        """Finalize remaining active tracks when the runtime stops gracefully."""
+        if self._shutdown_tracks_finalized:
+            return
+
+        reason = (
+            self._stop_reason
+            if self._stop_reason in {"manual_shutdown", "runtime_shutdown"}
+            else "runtime_shutdown"
+        )
+        before = metrics.tracks_finalized
+        for track in list(self._tracks.values()):
+            if track.finalized:
+                continue
+            if track.decision_finalized:
+                self._retire_track(track, reason)
+                continue
+            self.finalize_track(track, reason, metrics)
+
+        metrics.active_tracks_finalized_on_shutdown = max(
+            0, metrics.tracks_finalized - before
+        )
+        self._shutdown_tracks_finalized = True
+
     def _check_early_finalization(
         self,
         packet: FramePacket,
@@ -1392,16 +1591,25 @@ class ANPRProcessor:
         if self._capture is None:
             raise SourceRuntimeError("Video capture is not open.")
 
+        metrics = self._runtime_metrics
         source_type = self.config.source
         source_path = self._safe_source_path()
-        start_time = time.time()
+        loop_start_time = time.time()
         frame_index = 0
         pending: FramePacket | None = None
+        is_rtsp = source_type == "rtsp"
 
         while True:
+            if self._stop_requested:
+                self._stop_reason = self._stop_reason or "manual_shutdown"
+                if pending is not None:
+                    pending.is_last = True
+                    yield pending
+                break
+
             if (
                 self.config.max_seconds is not None
-                and (time.time() - start_time) >= self.config.max_seconds
+                and (time.time() - loop_start_time) >= self.config.max_seconds
             ):
                 self._stop_reason = "max_seconds_reached"
                 if pending is not None:
@@ -1411,6 +1619,30 @@ class ANPRProcessor:
 
             ok, frame = self._capture.read()
             if not ok:
+                if is_rtsp and self.config.rtsp_reconnect_enabled:
+                    if metrics is not None:
+                        metrics.rtsp_consecutive_read_failures += 1
+                        self._log_runtime_line(
+                            "RTSP read failure "
+                            f"count={metrics.rtsp_consecutive_read_failures}"
+                        )
+                    if (
+                        metrics is not None
+                        and metrics.rtsp_consecutive_read_failures
+                        < self.config.rtsp_read_failure_limit
+                    ):
+                        time.sleep(0.05)
+                        continue
+
+                    if not self._attempt_rtsp_reconnect(metrics):
+                        if pending is not None:
+                            pending.is_last = True
+                            yield pending
+                        break
+                    if metrics is not None:
+                        metrics.rtsp_consecutive_read_failures = 0
+                    continue
+
                 if pending is not None:
                     pending.is_last = True
                     yield pending
@@ -1421,6 +1653,10 @@ class ANPRProcessor:
                 else:
                     self._stop_reason = "stream_read_failed"
                 break
+
+            if metrics is not None:
+                metrics.rtsp_consecutive_read_failures = 0
+                metrics.last_frame_at = _utc_now_iso()
 
             packet = FramePacket(
                 frame_index=frame_index,
@@ -1483,9 +1719,17 @@ class ANPRProcessor:
         ]
         summary: dict = {
             "status": status,
-            "milestone": "M9",
+            "milestone": "M11",
             "source_type": self.config.source,
             "source_path": self._safe_source_path(),
+            "started_at": metrics.started_at,
+            "ended_at": metrics.ended_at,
+            "uptime_seconds": round(metrics.duration_seconds, 3),
+            "last_frame_at": metrics.last_frame_at,
+            "rtsp_reconnect_attempts": metrics.rtsp_reconnect_attempts,
+            "rtsp_reconnect_successes": metrics.rtsp_reconnect_successes,
+            "rtsp_consecutive_read_failures": metrics.rtsp_consecutive_read_failures,
+            "active_tracks_finalized_on_shutdown": metrics.active_tracks_finalized_on_shutdown,
             "evidence_mode": self.config.evidence_mode,
             "evidence_retention_days": self.config.evidence_retention_days,
             "frames_read": metrics.frames_read,
@@ -1652,10 +1896,18 @@ class ANPRProcessor:
         self._finalized_track_candidates = []
         self._finalized_events = []
         self._plate_last_event_at = {}
+        self._stop_requested = False
+        self._shutdown_tracks_finalized = False
+        self._runtime_metrics = metrics
+        self._last_health_log_at = None
+        self._last_backend_queue_flush_at = None
+        self._rtsp_reconnect_delay = self.config.rtsp_reconnect_initial_delay_seconds
+        metrics.started_at = _utc_now_iso()
+        self._install_signal_handlers()
 
         metrics.log_lines.extend(
             [
-                f"{'M9 dry-run' if dry_run else 'M9 run'} started.",
+                f"{'M11 dry-run' if dry_run else 'M11 run'} started.",
                 f"Source type: {self.config.source}",
                 f"Source: {self._source_label()}",
                 f"Validation mode: {validation_mode}",
@@ -1664,6 +1916,10 @@ class ANPRProcessor:
                 f"Backend queue file: {self.config.backend_queue_file}",
                 f"Target FPS: {self.config.target_fps}",
                 f"Max seconds: {self.config.max_seconds}",
+                f"RTSP reconnect enabled: {self.config.rtsp_reconnect_enabled}",
+                f"RTSP read failure limit: {self.config.rtsp_read_failure_limit}",
+                f"Health log interval seconds: {self.config.rtsp_health_log_interval_seconds}",
+                f"Backend queue flush interval seconds: {self.config.backend_queue_flush_interval_seconds}",
                 f"Track IoU threshold: {self.config.track_iou_threshold}",
                 f"Track expiry seconds: {self.config.track_expiry_seconds}",
                 f"Early finalize min votes: {self.config.early_finalize_min_votes}",
@@ -1679,6 +1935,7 @@ class ANPRProcessor:
             metrics.log_lines.append(f"Config warnings: {len(validation_result.warnings)}")
 
         start_time = time.time()
+        last_packet: FramePacket | None = None
         try:
             self.open_source()
             if self.config.source != "image":
@@ -1704,7 +1961,6 @@ class ANPRProcessor:
             self.load_models(metrics)
             self.load_ocr_engine(metrics)
 
-            last_packet: FramePacket | None = None
             for packet in self.iter_frames():
                 last_packet = packet
                 metrics.source_opened = True
@@ -1740,49 +1996,41 @@ class ANPRProcessor:
                     self._check_early_finalization(packet, metrics)
                     self.finalize_expired_tracks(packet, metrics)
 
+                self._maybe_log_health(metrics, start_time)
+                self._maybe_flush_backend_queue(metrics, run_dir, dry_run=dry_run)
+
                 if packet.is_last:
                     self.finalize_active_tracks_at_source_end(packet, metrics)
 
-            if last_packet is not None:
+            if last_packet is not None and self._stop_requested:
+                self.finalize_active_tracks_on_shutdown(last_packet, metrics)
+            elif last_packet is not None:
                 self.finalize_active_tracks_at_source_end(last_packet, metrics)
 
             metrics.active_tracks = sum(
                 1 for track in self._tracks.values() if not track.finalized
             )
 
-            metrics.source_completed = True
+            metrics.source_completed = not self._stop_requested or (
+                self._stop_reason in {"max_seconds_reached", "manual_shutdown", "runtime_shutdown"}
+            )
             self._finalize_stop_reason(metrics)
 
             if (
                 not dry_run
                 and self.config.backend_enabled
                 and self._backend_client is not None
-                and self.config.source in {"image", "video"}
             ):
-                flush_result = self._backend_client.flush_queue()
-                metrics.backend_jobs_succeeded += flush_result.succeeded
-                metrics.backend_jobs_failed += flush_result.failed
-                metrics.backend_jobs_exhausted += flush_result.exhausted
-                metrics.backend_logs_sent += flush_result.logs_sent
-                metrics.backend_images_sent += flush_result.images_sent
-                metrics.backend_camera_verified = flush_result.camera_verified
-                metrics.log_lines.append(
-                    "Backend queue flush: "
-                    f"processed={flush_result.processed} "
-                    f"succeeded={flush_result.succeeded} "
-                    f"failed={flush_result.failed} "
-                    f"exhausted={flush_result.exhausted} "
-                    f"pending={flush_result.pending} "
-                    f"malformed={flush_result.malformed} "
-                    f"images_sent={flush_result.images_sent} "
-                    f"logs_sent={flush_result.logs_sent} "
-                    f"camera_verified={flush_result.camera_verified}"
-                )
-                self._write_backend_results(run_dir, flush_result)
-                metrics.log_lines.append(f"Backend results written: {run_dir / 'backend_results.json'}")
+                flush_result = self._backend_client.flush_queue_safe()
+                self._apply_flush_result(metrics, flush_result, run_dir)
 
             if not dry_run:
                 self._cleanup_expired_evidence(run_dir, metrics)
+        except KeyboardInterrupt:
+            self.request_stop("manual_shutdown")
+            metrics.log_lines.append("Manual shutdown requested (KeyboardInterrupt)")
+            if last_packet is not None:
+                self.finalize_active_tracks_on_shutdown(last_packet, metrics)
         except SourceRuntimeError as exc:
             metrics.runtime_error = exc.message
             metrics.stop_reason = "runtime_error"
@@ -1792,6 +2040,8 @@ class ANPRProcessor:
         finally:
             self.close_source()
             metrics.duration_seconds = time.time() - start_time
+            metrics.ended_at = _utc_now_iso()
+            self._runtime_metrics = None
 
         metrics.log_lines.extend(
             [
@@ -1843,7 +2093,11 @@ class ANPRProcessor:
         metrics.log_lines.extend(
             [
                 f"Duration seconds: {metrics.duration_seconds:.3f}",
-                f"{'M9 dry-run' if dry_run else 'M9 run'} {status}.",
+                f"RTSP reconnect attempts: {metrics.rtsp_reconnect_attempts}",
+                f"RTSP reconnect successes: {metrics.rtsp_reconnect_successes}",
+                f"Active tracks finalized on shutdown: {metrics.active_tracks_finalized_on_shutdown}",
+                f"Last frame at: {metrics.last_frame_at}",
+                f"{'M11 dry-run' if dry_run else 'M11 run'} {status}.",
             ]
         )
 

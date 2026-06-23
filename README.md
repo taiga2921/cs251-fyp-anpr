@@ -1,12 +1,12 @@
 # AI ANPR v1
 
-**Current milestone:** M10 — Frontend ANPR Feature Architecture
+**Current milestone:** M11 — Realtime RTSP Runtime Architecture
 
 Python ANPR runtime for vehicle and license plate processing.
 
 Frontend monitoring is implemented in the React frontend under `src/feature/anpr-monitoring/`.
 
-Full M10 architecture: [docs/m10-frontend-anpr-feature-architecture.md](docs/m10-frontend-anpr-feature-architecture.md)
+Full M11 architecture: [docs/m11-realtime-rtsp-runtime-architecture.md](docs/m11-realtime-rtsp-runtime-architecture.md)
 
 ## Environment Setup
 
@@ -25,7 +25,7 @@ pip install -r requirements.txt
 
 ## Setup
 
-Place local YOLO `.pt` files before running detection. Configure models, OCR, tracking, events, and backend in `.env`:
+Place local YOLO `.pt` files before running detection. Configure models, OCR, tracking, events, backend, and RTSP in `.env`:
 
 ```env
 ANPR_VEHICLE_MODEL=models/vehicle/yolo11s.pt
@@ -35,6 +35,7 @@ ANPR_BACKEND_BASE_URL=http://localhost:8000/api
 ANPR_BACKEND_CAMERA_ID=
 ANPR_EVIDENCE_MODE=upload
 ANPR_EVIDENCE_RETENTION_DAYS=0
+ANPR_RTSP_URL=rtsp://user:password@camera-ip:554/stream1
 ```
 
 **Upload mode** is the recommended backend/cloud evidence path. The AI runtime uploads evidence files to Laravel, and Laravel stores them under `storage/app/anpr`.
@@ -48,10 +49,12 @@ python main.py check-config
 
 python main.py run --source image --image samples/images/photo_6177158287829176211_w.jpg --dry-run --strict
 python main.py run --source image --image samples/images/photo_6177158287829176211_w.jpg --strict
+python main.py run --source rtsp --max-seconds 30 --dry-run --strict
+python main.py run --source rtsp --max-seconds 30 --strict
 python main.py flush-backend-queue
 ```
 
-`--dry-run` has no backend side effects. Non-dry-run enqueues and flushes backend jobs after finite image/video sources.
+`--dry-run` has no backend side effects. Non-dry-run enqueues and flushes backend jobs. RTSP runs flush the queue periodically and again at shutdown.
 
 ## Output
 
@@ -59,6 +62,8 @@ Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.
 
 ## Documentation
 
-Full M10 architecture: [docs/m10-frontend-anpr-feature-architecture.md](docs/m10-frontend-anpr-feature-architecture.md)
+Full M11 architecture: [docs/m11-realtime-rtsp-runtime-architecture.md](docs/m11-realtime-rtsp-runtime-architecture.md)
+
+M10 frontend ANPR feature: [docs/m10-frontend-anpr-feature-architecture.md](docs/m10-frontend-anpr-feature-architecture.md)
 
 M9 evidence delivery: [docs/m9-evidence-delivery-architecture.md](docs/m9-evidence-delivery-architecture.md)

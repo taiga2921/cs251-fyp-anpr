@@ -1,4 +1,4 @@
-"""CLI entry point for AI ANPR (M9)."""
+"""CLI entry point for AI ANPR (M11)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from config import Config, RTSP_URL_CLI_ERROR, format_validation_output, is_rtsp
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-anpr",
-        description="AI ANPR CLI — M9 evidence delivery architecture",
+        description="AI ANPR CLI — M11 realtime RTSP runtime architecture",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -29,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run ANPR processing with M9 evidence delivery",
+        help="Run ANPR processing with M11 realtime RTSP runtime",
     )
     run_parser.add_argument(
         "--source",
