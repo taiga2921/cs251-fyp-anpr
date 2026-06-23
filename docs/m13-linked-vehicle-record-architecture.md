@@ -174,6 +174,13 @@ Existing `AnprMonitoringTest` (M12) must continue passing.
 - Admin vehicle management UI functional
 - ANPR detail shows linked vehicle context
 
+## M13 Hardening (Post-Acceptance)
+
+- Backend rejects empty-after-normalization plate values with 422 on `plate_number` (`POST /api/anpr-events`, `PATCH /api/anpr-events/{id}`, `POST /api/vehicles`).
+- Manual vehicle create normalizes plates and rejects normalized duplicates through shared `AnprVehicleLinker` lookup (including legacy separators `-`, space, `.`, `_`, `/`, `\`).
+- `PATCH /api/anpr-events/{id}` prohibits `vehicle_id` and `is_flagged`; plate changes relink via `AnprVehicleLinker` and re-derive `is_flagged` from linked vehicle status.
+- AI event payload remains unchanged (no `vehicle_id`).
+
 ## M13 Pass Condition
 
 When the AI runtime posts an ANPR event without `vehicle_id`, Laravel links or creates the vehicle, returns the vehicle relation in the event resource, and the React ANPR event detail displays linked vehicle information. Admins can manage vehicle records under Admin → Management → Vehicle with immutable plate number and source.
