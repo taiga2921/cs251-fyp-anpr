@@ -33,6 +33,8 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\activate
 python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
 ## Setup
@@ -61,6 +63,9 @@ python main.py check-config
 
 python main.py run --source image --image samples/images/photo_6177158287829176211_w.jpg --dry-run --strict
 python main.py run --source image --image samples/images/photo_6177158287829176211_w.jpg --strict
+python main.py run --source image --image samples/images/photo_6177158287829176212_w.jpg --strict
+python main.py run --source video --video samples/videos/document_6177158287369184218.mp4 --dry-run --strict
+python main.py run --source video --video samples/videos/document_6177158287369184218.mp4 --strict
 python main.py run --source rtsp --max-seconds 30 --dry-run --strict
 python main.py run --source rtsp --max-seconds 30 --strict
 python main.py flush-backend-queue
