@@ -95,6 +95,8 @@ multipart/form-data:
 
 Laravel stores files under `storage/app/anpr/events/{event_id}/` and creates or updates `anpr_images` rows. The queue processes each job using its stored `evidence_mode`, so old metadata jobs are not broken by later `.env` changes.
 
+Upload validation errors returned by Laravel are appended to AI `last_error` (for example `image: The image failed to upload.`). Transient upload `image` field 422 responses remain retryable as `failed` rather than terminal `validation_failed`.
+
 Backend-owned files are the preferred cloud deployment path.
 
 ## Evidence Delivery Logs
@@ -129,7 +131,10 @@ Older queue lines normalize missing fields on read.
 - Each successful image/log row checkpointed immediately
 - Retries skip succeeded rows
 - `posting` + `backend_event_id` jobs remain recoverable (M7/M8 durability)
-- Validation failures are final; network/5xx retry until limit
+- Terminal validation failures (`validation_failed`) for invalid `image_type`, unknown `evidence_mode`, and non-retryable 404/422 payloads
+- Retryable upload validation errors on `/images/upload` (for example transient `image` upload failures) remain `failed` and retry until the limit
+- Network/5xx retry until limit
+- `last_error` includes Laravel field-level validation detail when available
 
 ## Local Evidence Retention Policy
 

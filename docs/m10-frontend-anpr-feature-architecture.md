@@ -188,7 +188,7 @@ Displays:
 - Evidence gallery (full → plate → annotated)
 - Back and Refresh actions
 
-Raw backend event payloads are not rendered on the detail page to avoid exposing sensitive relationship fields such as camera credentials.
+Raw backend event payloads are not rendered on the detail page. Nested camera data is monitoring-safe: name, location, and active status only — no IP, port, RTSP URL, or credentials.
 
 ## Evidence Display Strategy
 
@@ -248,7 +248,7 @@ Security Operator menu filtering in `getMenuItemsForRole.js` includes `operator-
 7. Confirm evidence previews load when Laravel can resolve files
 8. Confirm missing evidence files show safe placeholders
 9. Confirm no event logs or raw metadata are displayed
-10. Confirm camera credentials are not visible in network responses
+10. Confirm camera IP, port, RTSP URL, and credentials are not visible in network responses or the detail UI
 11. Confirm Security Operator can access the feature
 12. Confirm Guard cannot access the feature
 13. Run `yarn lint` and `yarn build` in `frontend-react-v1`

@@ -29,6 +29,40 @@ STATUS_RETRYABLE = frozenset({"pending", "failed"})
 MAX_PLATE_NUMBER_LENGTH = 20
 MAX_FILE_PATH_LENGTH = 255
 
+RETRYABLE_UPLOAD_IMAGE_ERROR_PHRASES = (
+    "failed to upload",
+    "field is required",
+    "must be a file",
+    "may not be greater than",
+)
+
+
+def _format_validation_errors(errors: dict[str, Any] | None) -> str:
+    if not errors:
+        return ""
+
+    parts: list[str] = []
+    for field, messages in errors.items():
+        if isinstance(messages, list):
+            for message in messages:
+                parts.append(f"{field}: {message}")
+        elif messages is not None:
+            parts.append(f"{field}: {messages}")
+    return " ".join(parts)
+
+
+def _backend_http_error_message(
+    status_code: int,
+    path: str,
+    message: str,
+    errors: dict[str, Any] | None,
+) -> str:
+    base = f"HTTP {status_code} for {path}: {message}"
+    detail = _format_validation_errors(errors)
+    if detail:
+        return f"{base} {detail}"
+    return base
+
 
 class BackendApiError(RuntimeError):
     """Structured backend HTTP or network error."""
@@ -54,6 +88,33 @@ class BackendApiError(RuntimeError):
         if self.status_code is None:
             return True
         return self.status_code >= 500
+
+
+def _is_retryable_upload_validation_error(exc: BackendApiError) -> bool:
+    if exc.status_code != 422:
+        return False
+    if "/images/upload" not in exc.path:
+        return False
+
+    errors = exc.errors or {}
+    image_errors = errors.get("image")
+    if not image_errors:
+        return False
+
+    if isinstance(image_errors, list):
+        combined = " ".join(str(item).lower() for item in image_errors)
+    else:
+        combined = str(image_errors).lower()
+
+    return any(phrase in combined for phrase in RETRYABLE_UPLOAD_IMAGE_ERROR_PHRASES)
+
+
+def _should_treat_as_validation_failed(exc: BackendApiError) -> bool:
+    if not exc.is_validation_failure():
+        return False
+    if _is_retryable_upload_validation_error(exc):
+        return False
+    return True
 
 
 @dataclass
@@ -464,7 +525,7 @@ class BackendClient:
             if isinstance(data, dict) and isinstance(data.get("errors"), dict):
                 errors = data["errors"]
             raise BackendApiError(
-                f"HTTP {exc.code} for {path}: {message}",
+                _backend_http_error_message(exc.code, path, message, errors),
                 status_code=exc.code,
                 path=path,
                 errors=errors,
@@ -540,7 +601,7 @@ class BackendClient:
             if isinstance(data, dict) and isinstance(data.get("errors"), dict):
                 errors = data["errors"]
             raise BackendApiError(
-                f"HTTP {exc.code} for {path}: {message}",
+                _backend_http_error_message(exc.code, path, message, errors),
                 status_code=exc.code,
                 path=path,
                 errors=errors,
@@ -825,7 +886,7 @@ class BackendClient:
         key: str,
         exc: BackendApiError,
     ) -> None:
-        if exc.is_validation_failure():
+        if _should_treat_as_validation_failed(exc):
             bucket[key] = "validation_failed"
         else:
             bucket[key] = "failed"
@@ -990,7 +1051,7 @@ class BackendClient:
         ):
             job.evidence_delivery_status = "failed"
 
-        if isinstance(exc, BackendApiError) and exc.is_validation_failure():
+        if isinstance(exc, BackendApiError) and _should_treat_as_validation_failed(exc):
             job.status = "validation_failed"
             return job
 
