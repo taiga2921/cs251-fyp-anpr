@@ -179,6 +179,7 @@ Existing `AnprMonitoringTest` (M12) must continue passing.
 - Backend rejects empty-after-normalization plate values with 422 on `plate_number` (`POST /api/anpr-events`, `PATCH /api/anpr-events/{id}`, `POST /api/vehicles`).
 - Manual vehicle create normalizes plates and rejects normalized duplicates through shared `AnprVehicleLinker` lookup (including legacy separators `-`, space, `.`, `_`, `/`, `\`).
 - `PATCH /api/anpr-events/{id}` prohibits `vehicle_id` and `is_flagged`; plate changes relink via `AnprVehicleLinker` and re-derive `is_flagged` from linked vehicle status.
+- The backend normalized lookup uses MySQL-safe `CHAR(92)` for backslash removal; the AI payload remains unchanged.
 - AI event payload remains unchanged (no `vehicle_id`).
 
 ## M13 Pass Condition
