@@ -1,29 +1,5 @@
 # AI ANPR v1
 
-**Current milestone:** M15 — Performance and Accuracy Tuning Architecture
-
-M15 tunes runtime FPS, OCR efficiency, event latency metrics, backend list performance, and frontend polling backoff while preserving M12–M14 behavior.
-
-Full M15 architecture: [docs/m15-performance-and-accuracy-tuning-architecture.md](docs/m15-performance-and-accuracy-tuning-architecture.md)
-
-M14 adds regression coverage across the AI runtime, Laravel ANPR APIs, React ANPR UI, and manual end-to-end flows.
-
-Full M14 architecture: [docs/m14-testing-architecture.md](docs/m14-testing-architecture.md)
-
-M13 keeps the AI event payload unchanged. Laravel links each ANPR event to an existing vehicle record or auto-creates one when the plate is unknown.
-
-Full M13 architecture: [docs/m13-linked-vehicle-record-architecture.md](docs/m13-linked-vehicle-record-architecture.md)
-
-M12 connects the M11 RTSP runtime, Laravel ANPR APIs, and React ANPR monitoring page so new detections appear automatically in the frontend. This is live event monitoring, not video livestreaming.
-
-Full M12 architecture: [docs/m12-live-anpr-monitoring-architecture.md](docs/m12-live-anpr-monitoring-architecture.md)
-
-Python ANPR runtime for vehicle and license plate processing.
-
-Frontend monitoring is implemented in the React frontend under `src/feature/anpr-monitoring/`.
-
-Full M11 architecture: [docs/m11-realtime-rtsp-runtime-architecture.md](docs/m11-realtime-rtsp-runtime-architecture.md)
-
 ## Environment Setup
 
 Recommended Python version:
@@ -39,6 +15,7 @@ python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 ```
 
 ## Setup
