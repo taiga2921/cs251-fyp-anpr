@@ -1,6 +1,10 @@
 # AI ANPR v1
 
-**Current milestone:** M12 — Live ANPR Monitoring Architecture
+**Current milestone:** M13 — Linked Vehicle Record Architecture
+
+M13 keeps the AI event payload unchanged. Laravel now links each ANPR event to an existing vehicle record or auto-creates one when the plate is unknown.
+
+Full M13 architecture: [docs/m13-linked-vehicle-record-architecture.md](docs/m13-linked-vehicle-record-architecture.md)
 
 M12 connects the M11 RTSP runtime, Laravel ANPR APIs, and React ANPR monitoring page so new detections appear automatically in the frontend. This is live event monitoring, not video livestreaming.
 
