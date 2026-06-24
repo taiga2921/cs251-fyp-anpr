@@ -54,6 +54,10 @@ python main.py flush-backend-queue
 
 `--dry-run` has no backend side effects. Non-dry-run enqueues and flushes backend jobs. RTSP runs flush the queue periodically and again at shutdown.
 
+## Blockchain module (out of scope for AI)
+
+AI ANPR **does not own blockchain** integration. The runtime sends final ANPR events and evidence to **Laravel only**; Laravel decides which records receive deterministic hashes and on-chain anchoring (see [`../blockchain-module.md`](../blockchain-module.md)). Do not add Ethereum RPC calls, wallet keys, or blockchain proof logic to this Python project.
+
 ## Output
 
 Each run creates `runs/run_YYYYMMDD_HHMMSS/` with `worker.log`, `worker_summary.json`, `events.jsonl`, `evidence/`, and (after backend flush) `backend_results.json`. Queue state: `.cache/backend_queue.jsonl`.
