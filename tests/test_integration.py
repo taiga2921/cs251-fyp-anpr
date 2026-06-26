@@ -6,12 +6,29 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import importlib.machinery
 import numpy as np
 import pytest
 
 from anpr import DryRunResult, RuntimeMetrics
 from config import ValidationResult
+import config as config_module
 import main
+
+
+def _mock_paddleocr_installed(monkeypatch) -> None:
+    original_find_spec = config_module.importlib.util.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "paddleocr":
+            return importlib.machinery.ModuleSpec("paddleocr", loader=None)
+        return original_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        config_module.importlib.util,
+        "find_spec",
+        fake_find_spec,
+    )
 
 
 def _fake_dry_run_result(run_dir: Path) -> DryRunResult:
@@ -52,6 +69,7 @@ class TestCliIntegration:
     def test_run_image_dry_run_strict_with_mocked_processor(
         self, minimal_config, sample_image, fake_model_files, monkeypatch, project_root
     ):
+        _mock_paddleocr_installed(monkeypatch)
         minimal_config.image_path = str(sample_image)
         run_dir = project_root / "runs/run_test"
         run_dir.mkdir(parents=True)
@@ -84,6 +102,7 @@ class TestCliIntegration:
     def test_run_video_dry_run_strict_with_mocked_processor(
         self, minimal_config, sample_video, fake_model_files, monkeypatch, project_root
     ):
+        _mock_paddleocr_installed(monkeypatch)
         minimal_config.video_path = str(sample_video)
         minimal_config.source = "video"
         run_dir = project_root / "runs/run_video"
